@@ -4,17 +4,24 @@
  * 为什么需要这个测试：真实 `dsh web` 跑通需要真实 Telegram Bot，
  * 而**安全关键路径**必须被验证：
  *   Secret Key 校验 → 生成带外批准 → Telegram 批准/拒绝 → 单次凭证交换 → 不可重放。
- * 这里用一个最小 fake ctx 直接驱动插件的 `apply`，并用假的 `fetch` 喂 Telegram update。
+ * 这里用一个最小 fake ctx 直接驱动插件的 `apply`，并用假的 HTTPS 请求喂 Telegram update。
  *
  * 运行：
  *   cd dsh && node --import tsx/esm ../opendsh/tests/gate.test.mts
  */
 
 import { strict as assert } from 'node:assert'
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
+import { createServer } from 'node:http'
+import { SessionStore } from '../src/sessions.ts'
+import { FailureLimiter } from '../src/rate-limit.ts'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveConfig } from '../src/config.ts'
+import https from 'node:https'
+import { EventEmitter } from 'node:events'
+import { Readable } from 'node:stream'
+import { syncBuiltinESMExports } from 'node:module'
 
 // 让插件把 offset 写到临时目录，避免污染。
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'tla-test-'))
@@ -36,7 +43,7 @@ chmodSync(secretFile, 0o600)
 
 interface TgUpdate {
   update_id: number
-  message?: { message_id: number; chat: { id: number; type?: string }; from?: { id: number }; text?: string }
+  message?: { message_id: number; chat: { id: number; type?: string }; from?: { id: number }; text?: string; reply_to_message?: { message_id: number } }
   callback_query?: {
     id: string
     from: { id: number }
@@ -45,24 +52,22 @@ interface TgUpdate {
   }
 }
 
-const tg = { sendMessage: 0, getUpdates: 0, unknown: 0, texts: [] as string[] }
+const tg = { sendMessage: 0, getUpdates: 0, unknown: 0, texts: [] as string[], payloads: [] as Record<string, any>[] }
 const queue: TgUpdate[] = []
 let firstUpdatesDone = false
 
-function json(value: unknown): Response {
-  return new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } })
-}
+function json(value: Record<string, unknown>): Record<string, unknown> { return value }
 
-globalThis.fetch = (async (input: unknown, init?: { body?: unknown }) => {
-  const url = String(typeof input === 'string' ? input : (input as { url: string }).url)
+async function telegramResponse(url: string, body: string): Promise<Record<string, unknown>> {
   const method = url.slice(url.lastIndexOf('/') + 1)
-  const payload = init?.body === undefined ? {} : JSON.parse(String(init.body)) as Record<string, unknown>
+  const payload = JSON.parse(body) as Record<string, unknown>
   switch (method) {
     case 'getMe':
       return json({ ok: true, result: { username: 'testbot' } })
     case 'sendMessage':
       tg.sendMessage += 1
       tg.texts.push(String(payload.text ?? ''))
+      tg.payloads.push(payload)
       return json({ ok: true, result: { message_id: TG_MESSAGE_ID } })
     case 'editMessageText':
     case 'answerCallbackQuery':
@@ -82,7 +87,21 @@ globalThis.fetch = (async (input: unknown, init?: { body?: unknown }) => {
       tg.unknown += 1
       return json({ ok: true, result: true })
   }
-}) as typeof fetch
+}
+
+// HTTPS 替身沿用既有 Telegram 队列；全局 fetch 一旦被调用就让验证失败。
+https.request = ((input: string, _options: unknown, callback: (response: Readable) => void) => {
+  const req = new EventEmitter() as EventEmitter & { end(body: string): void }
+  req.end = body => {
+    void telegramResponse(String(input), body).then(
+      value => { callback(Readable.from([JSON.stringify(value)])) },
+      error => { req.emit('error', error) },
+    )
+  }
+  return req
+}) as typeof https.request
+syncBuiltinESMExports()
+globalThis.fetch = async () => { throw new Error('Telegram 不应经过全局 fetch') }
 
 const mod = await import('../src/index.ts')
 
@@ -101,12 +120,14 @@ class FakeConnection {
   /** 记录原 authorizeIndex 被真正调用的次数（即凭证交换次数）。 */
   static exchanges = 0
 
-  requestRejection(_req: { headers: unknown }): number | undefined {
-    // 未认证：返回 401，门禁据此渲染登录表单。
-    return 401
+  browserAuth = { maxAgeMilliseconds: 30 * 86400_000 }
+  requestRejection(req: { headers: Record<string, string> }): number | undefined {
+    if (req.headers.host !== 'test.example.com' || (req.headers.origin && req.headers.origin !== ORIGIN)) return 403
+    return req.headers.cookie?.includes('fake-session=v1.signed') ? undefined : 401
   }
 
   authorizeIndex(_req: { url?: string }, res: { writeHead(s: number, h?: Record<string, string>): void; end(b?: string): void }): boolean {
+    if (_req.url === '/' && this.requestRejection(_req as any) === undefined) return true
     FakeConnection.exchanges += 1
     res.writeHead(303, { 'set-cookie': 'fake-session=v1.signed' })
     res.end()
@@ -120,6 +141,7 @@ class FakeConnection {
 
 const logs: string[] = []
 const effects: Array<() => void> = []
+const httpServer = createServer()
 const routes = new Map<string, (req: unknown, res: unknown) => unknown>()
 
 function makeCtx(): unknown {
@@ -138,6 +160,7 @@ function makeCtx(): unknown {
     },
     on: (_name: string, _fn: (...args: unknown[]) => void) => () => { /* 取消订阅 */ },
     webServer: {
+      host: '127.0.0.1', port: 3080, server: httpServer,
       register: (route: { path: string; handler: (req: unknown, res: unknown) => unknown }) => {
         routes.set(route.path, route.handler)
         return () => { routes.delete(route.path) }
@@ -325,6 +348,7 @@ await check('错误 Secret Key → 401 且不发送任何 Telegram 通知', asyn
 
 let cookie = ''
 let requestId = ''
+let sessionCookie = ''
 await check('正确 Secret Key → 303 到等待页并下发 nonce cookie', async () => {
   const before = tg.sendMessage
   const out = await postLogin()
@@ -366,9 +390,11 @@ await check('【安全】Telegram 批准 → 单次交换 DSH 凭证（303 → /
   assert.equal(out.status, 303, `期望 303，实际 ${out.status}`)
   assert.equal(out.headers.location, '/', '应重定向到根路径')
   const setCookie = out.headers['set-cookie'] as string[]
-  assert.ok(Array.isArray(setCookie), '应同时写入会话与清理 nonce 两个 cookie')
+  assert.ok(Array.isArray(setCookie), '应同时写入原生会话、新会话与清理 nonce cookie')
   assert.ok(String(setCookie[0]).includes('; Secure'), '会话 cookie 应追加 Secure')
   assert.ok(String(setCookie[1]).includes('__Host-dsh-login=;'), '应清除 nonce cookie')
+  assert.ok(String(setCookie[2]).startsWith('__Host-dsh-web-session='), '必须签发新会话层')
+  sessionCookie = `fake-session=v1.signed; ${setCookie[2]!.split(';')[0]}`
 })
 
 await check('【安全】批准不可重放：再次访问等待页被拒', async () => {
@@ -409,14 +435,84 @@ await check('配置：botUsername 去掉前导 @ 并规范化', () => {
   assert.equal(resolveConfig({ ...base, botUsername: '' }).botUsername, '', '未配置时应为空串')
 })
 
-await check('配置：浏览器批准 TTL 固定为 300 秒', () => {
-  assert.throws(() => resolveConfig({ ...base, ttlSeconds: 60 }), /TTL/)
+await check('配置：批准TTL可调且限定30–3600秒', () => {
+  assert.equal(resolveConfig({ ...base, ttlSeconds: 60 }).ttlSeconds, 60)
+  assert.throws(() => resolveConfig({ ...base, ttlSeconds: 29 }))
+})
+
+await check('【安全】仅原生旧Cookie被拒，新会话可持久化且多浏览器独立', () => {
+  const c = new FakeConnection()
+  assert.equal(c.requestRejection(makeReq('GET', '/api', { cookie: 'fake-session=v1.signed' }) as any), 401)
+  assert.equal(c.requestRejection(makeReq('GET', '/api', { cookie: sessionCookie }) as any), undefined)
+  assert.equal(c.requestRejection(makeReq('GET', '/api', { cookie: sessionCookie, origin: 'https://evil.example' }) as any), 403)
+  const file = `${process.env.DSH_HOME}/storages/telegram-login-approval/web-sessions.json`
+  const restarted = new SessionStore(file)
+  assert.ok(restarted.find({ headers: { host: 'test.example.com', cookie: sessionCookie } }))
+  const second = restarted.create('test.example.com', 'second browser', 1).split(';')[0]!
+  assert.equal(restarted.list().length, 2)
+  assert.ok(restarted.find({ headers: { host: 'test.example.com', cookie: sessionCookie } }))
+  restarted.revoke(restarted.list()[1]!.id)
+  const again = new SessionStore(file)
+  assert.equal(again.find({ headers: { host: 'test.example.com', cookie: second } }), undefined)
+  assert.ok(again.find({ headers: { host: 'test.example.com', cookie: sessionCookie } }))
+  assert.ok(!readFileSync(file, 'utf8').includes(sessionCookie.split('=')[2]!), '落盘不得有原始会话token')
+})
+
+await check('【安全】管理卡片私聊/消息绑定、设置回复绑定、踢出二次确认与日志不泄密', async () => {
+  const command = (from: number, type: string) => ({ update_id: 1000001, message: { message_id: 91, from: { id: from }, chat: { id: from, type }, text: '/web' } })
+  const before = tg.sendMessage
+  queue.push(command(999, 'private'), command(ADMIN, 'group'))
+  await sleep(60)
+  assert.equal(tg.sendMessage, before)
+  queue.push(command(ADMIN, 'private')); await sleep(60)
+  let payload = tg.payloads.at(-1)!
+  assert.ok(payload.text.includes('🌐 <b>Web 管理台</b>'))
+  assert.equal(payload.reply_markup.inline_keyboard[0].length, 2)
+  const setData = payload.reply_markup.inline_keyboard[2][0].callback_data
+  const wrong = callbackUpdate('web', setData)
+  wrong.callback_query!.message!.message_id = 999
+  queue.push(wrong); await sleep(40)
+  assert.equal(tg.payloads.at(-1), payload)
+  queue.push(callbackUpdate('web', setData)); await sleep(40)
+  assert.ok(tg.payloads.at(-1)!.reply_markup.force_reply)
+  queue.push({ update_id: 1000002, message: { message_id: 92, from: { id: ADMIN }, chat: { id: ADMIN, type: 'private' }, text: '60', reply_to_message: { message_id: TG_MESSAGE_ID } } } as TgUpdate)
+  await sleep(60)
+  const file = `${process.env.DSH_HOME}/storages/telegram-login-approval/web-settings.json`
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).approvalSeconds, 60)
+  const next = await postLogin()
+  assert.ok(String(next.headers['set-cookie']).includes('Max-Age=60'))
+  queue.push(command(ADMIN, 'private')); await sleep(40)
+  payload = tg.payloads.at(-1)!
+  const kickAll = payload.reply_markup.inline_keyboard[4][0].callback_data
+  queue.push(callbackUpdate('web', kickAll)); await sleep(40)
+  assert.equal(new FakeConnection().requestRejection(makeReq('GET', '/api', { cookie: sessionCookie }) as any), undefined, '首次点击不应撤销')
+  const yes = tg.payloads.at(-1)!.reply_markup.inline_keyboard[0][0].callback_data
+  queue.push(callbackUpdate('web', yes)); await sleep(60)
+  assert.equal(new FakeConnection().requestRejection(makeReq('GET', '/api', { cookie: sessionCookie }) as any), 401)
+  assert.equal(request('GET', '/', { cookie: sessionCookie }).status, 200, '撤销后首页必须回登录表单')
+  assert.equal(new SessionStore(`${process.env.DSH_HOME}/storages/telegram-login-approval/web-sessions.json`).list().length, 0)
+  assert.ok(!logs.join('\n').includes(SECRET) && !logs.join('\n').includes(sessionCookie))
+})
+
+await check('【安全】错误密钥10次/60秒后真正全局冷却600秒，不是通知限流', async () => {
+  // 前面的首条错误仍在同一窗口，补9次达到10次。
+  for (let i = 0; i < 9; i++) assert.equal((await postLogin(undefined, 'bad')).status, 401)
+  const out = await postLogin()
+  assert.equal(out.status, 429)
+  assert.ok(Number(out.headers['retry-after']) > 590)
+  const limit = new FailureLimiter(600)
+  for (let i = 0; i < 10; i++) limit.record(100000)
+  assert.equal(limit.check(100000), 600)
+  limit.cooldownSeconds = 60
+  assert.equal(limit.check(100000), 600, '旧冷却不变')
+  assert.equal(limit.check(700001), 0)
 })
 
 await check('卸载后还原原型方法', () => {
   for (const dispose of effects) dispose()
   const proto = Object.getPrototypeOf(new FakeConnection()) as { authorizeIndex: { name: string } }
   assert.equal(proto.authorizeIndex.name, 'authorizeIndex', '应还原为原方法')
+  assert.equal(new FakeConnection().requestRejection(makeReq('GET', '/api', { cookie: 'fake-session=v1.signed' }) as any), undefined, 'requestRejection应还原')
 })
 
 // ---------------------------------------------------------------------------

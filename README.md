@@ -19,12 +19,14 @@ DSH 的 Web 登录是「每进程随机 token → 换取**30 天**签名 cookie�
 | token 泄露即接管 | 拿到正确 token 可直接换到 30 天会话，中间**没有任何人工确认环节** |
 | 没有 logout | 官方文档明确：撤销只能「删凭据记录 + 重启 `dsh`」 |
 
-本插件补上第一个：**即使攻击者拿到了正确的 token，你不点确认就拿不到会话。**
+本插件补上这两个缺口：**旧 launch token 不能直接登录；必须输入独立密钥并经 Telegram 批准。**
+同时增加持久化、可撤销的独立浏览器会话。升级后旧浏览器须重新登录一次，不保留仅有旧 DSH Cookie 的兼容路径。
 
 ## 工作原理
 
-不接管 `/`，而是包装 `ctx.connection.authorizeIndex`。
-index.html 的提供、目录遍历防护、`<base>` 注入全部保持 DSH 原样。
+不接管 `/` 的静态提供，而是包装共享 `ctx.connection.authorizeIndex` 和 `requestRejection`，
+在 DSH 原生签名 Cookie 之外叠加独立持久化会话，并在 WebServer upgrade 分发前检查。
+index.html 的提供、目录遍历防护、`<base>` 注入及原 Host/Origin fence 全部保持 DSH 原样。
 
 登录入口不再依赖 URL 里的 token，而是要求一个**长期独立 Secret Key**：
 
@@ -46,6 +48,8 @@ GET /login/status?request=… → 校验 nonce cookie 与请求绑定
 
 **关键安全性质**：批准只是「准入」，不是「认证」。批准后仍由 DSH 原方法签发会话 cookie，
 且批准**单次消费**、绑定浏览器 nonce——重放等待页只会得到 401。
+还会签发独立 `__Host-dsh-web-session` Cookie；服务端只存随机凭证哈希和会话元数据。
+任意多个浏览器可分别获批，不互相顶掉；过期/撤销实际拦截首页、API 与新 WS，并关闭该会话已有 WS。
 
 ### 旧 launch token 已停用
 
@@ -76,7 +80,9 @@ head -c 32 /dev/urandom | base64 | tr -d '\n' > /etc/dsh/web-secret.key
 文件必须是 **root 所有、权限 600 的普通文件**（正好 43 字符的 base64）。
 插件启动时会强制校验，不满足直接抛错——不会静默放行。
 
-登录后在 Telegram 私聊你的 Bot 发送 `/key`，即可随时取回该密钥。
+在管理员 Telegram 私聊发送 `/key` 可取回密钥；发送 `/web` 或 `/start` 打开 **🌐 Web 管理台**。
+管理台展示实际绑定、内部/公开地址、密钥、Web 会话数、待批准数和各期限；支持交互设置、会话列表与踢出。
+重置密钥、逐个/全部踢出均二次确认。完整说明见 [Web 管理台与启动衔接](docs/web-console.md)。
 
 ### 3. 放置插件
 
@@ -115,6 +121,12 @@ node --import tsx/esm apps/cli/src/bin.ts \
 
 > `--patch` 属于 `dsh` 层级参数，必须放在 `--profile` **之后**、app 参数（`--no-open` 等）**之前**。
 
+**要让管理台保存的绑定地址/端口生效**，后续部署必须采用 [`scripts/serve.ts`](scripts/serve.ts)
+启动衔接（配置 [`scripts/serve.example.json`](scripts/serve.example.json)），或人工将保存值写入实际启动参数。
+脚本从 `web-settings.json` 加载绑定与公开地址，传入 `--host/--port/--trusted-host`；
+保留 READY/UNLOADED fail-closed 衔接并截获含 launch token 的上游 URL 输出。
+详见 [部署步骤](docs/web-console.md#启动衔接后续人工部署)。**面板不会自动重启或修改 nginx/DNS。**
+
 ### 6. 首次登录
 
 直接访问 `https://<你的 publicOrigin>/`，输入 Secret Key。
@@ -132,17 +144,21 @@ node --import tsx/esm apps/cli/src/bin.ts \
 | `botTokenRef` | — | Bot Token 的**环境变量名**（推荐） |
 | `botToken` | — | 直接写 token（不推荐，容易误提交） |
 | `adminChatId` | **必填** | 唯一被接受的 Telegram 数字用户 ID |
-| `ttlSeconds` | `300` | 批准请求有效期（当前固定 300） |
-| `windowSeconds` | `600` | 限流窗口 |
+| `ttlSeconds` | `300` | 新批准有效期，30–3600 整数秒；nonce Cookie 同步使用该期限 |
+| `sessionDays` | `30` | 新Web会话有效期，整数天；不得超过当前DSH原生 `cookieMaxAgeDays` |
+| `failureCooldownSeconds` | `600` | 全局10次错误密钥/60秒后冷却，60–86400整数秒 |
+| `windowSeconds` | `600` | Telegram确认通知触发限流窗口（与错误密钥冷却独立） |
 | `maxTriggersPerWindow` | `3` | 窗口内最多触发次数 |
-| `cooldownSeconds` | `600` | 超限后的冷却时长 |
+| `cooldownSeconds` | `600` | 通知触发超限后的冷却时长（不控制错误密钥冷却） |
 | `notifyOnDeny` | `true` | 是否回发拒绝提示 |
 | `dryRun` | `false` | `true` = 不碰网络，仅本地验证门禁行为 |
-| `dataDir` | `$DSH_HOME/storages/telegram-login-approval` | offset 落盘目录 |
+| `dataDir` | `$DSH_HOME/storages/telegram-login-approval` | offset、Web设置与会话落盘目录；与启动衔接配置保持一致 |
 
 **配置缺失会直接抛错**，而不是静默退化成「无门禁」——这是安全路径，
 不允许「忘配就等于不生效」。`publicOrigin` 与 `botUsername` 都是配置项，
-源码里不写死任何具体域名或 Bot。
+源码里不写死任何具体域名或 Bot。面板设置保存后优先于 overlay 默认值；
+期限设置立即用于新条目，旧会话/批准/已启动冷却保持原截止时间。
+绑定/公开地址只在下次人工启动加载，面板同时显示运行值与待生效值。
 
 ## 任务完成通知
 
@@ -170,11 +186,11 @@ npm test
 
 ```bash
 cd /path/to/deepseek-harness
-node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/gate.test.mts        # 18 个用例
-node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test.mts  # 12 个用例
+node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/gate.test.mts  # 21 个用例
+node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/task-watch.test.mts  # 12 个用例
 ```
 
-**30 个用例，全部不需要真实 Bot**：用 fake ctx + 假 `fetch` 驱动完整的
+**33 个用例，全部不需要真实 Bot**：用 fake ctx + 假 HTTPS 请求驱动完整的
 「Secret Key → 带外批准 → 单次凭证交换 → 不可重放」链路。
 
 覆盖的关键性质：
@@ -187,6 +203,8 @@ node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test
 - 拒绝 → 403 且不发凭证
 - 配置校验：缺 `adminChatId` / 非 HTTPS `publicOrigin` / 非法 `botUsername` 均抛错
 - `prototype` 补丁确实生效（新 facade 也命中）；卸载后还原
+- 新会话哈希持久化、多浏览器独立、旧 Cookie 拒绝、撤销后不复活
+- 管理台私聊/消息绑定、设置回复绑定、踢出二次确认、错误密钥全局冷却
 - 多轮任务只推一条通知；静置期重新开跑则取消通知；`dispose` 后不再触发
 
 ## 安全说明
@@ -194,6 +212,8 @@ node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test
 - 批准请求**只存内存**，进程重启即全部失效（fail-closed）。
 - 批准**单次消费**，不可重放；批准绑定浏览器随机 nonce（`__Host-` cookie）。
 - **日志不出现 Secret Key / nonce / cookie / Bot Token**；pending 只存 `sha256(nonce)`。
+- Telegram 请求使用 Node 内置 `node:https`，不经过全局 `fetch`，避免 bili 等同进程模型代理钩子记录含 Bot Token 的 URL；网络异常与 API 错误说明中的 Token 统一脱敏。
+- 若旧版本已把 Bot Token 写入日志，升级不会消除旧记录或撤销 Token；需在 BotFather 更换 Token，并更新部署环境变量。
 - 只接受 `adminChatId` 的**私聊**消息，其余静默忽略并记日志。
 - 插件异常一律 **fail-closed**（按未认证处理），不擅自放行。
 - 输入正文限制 4 KiB，错误密钥不触发任何通知。
@@ -204,13 +224,17 @@ node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test
 ## 已知限制
 
 - DSH 处于**开发者预览**，官方警告会有破坏性变更。本插件依赖
-  `ctx.connection.authorizeIndex` / `requestRejection` 与 `ctx.webServer`，
+  `ctx.connection.authorizeIndex` / `requestRejection` / `browserAuth.maxAgeMilliseconds` 与 `ctx.webServer.server`，
   DSH 升级后建议重跑测试。
 - 依赖 `authorizeIndex` 无服务端副作用（只签名 cookie、不写状态）。
   若上游改为写会话表，探测方式需要重新评估。
-- **会话撤销（`/revoke`）尚未实现**。当前撤销全部会话仍需「删凭据记录 + 重启 `dsh`」。
+- 撤销通过 `/web` 的逐个/全部踢出按钮，不提供独立 `/revoke` 指令。
 - 批准请求不持久化 —— 这是刻意的 fail-closed 选择，不是缺陷。
-- 撤销当前浏览器会话仍需手动清除其 cookie；插件无法单方面吊销 DSH 已签发的会话。
+- 单进程管理一个状态目录；不支持多个DSH进程共享写同一会话/设置文件。
+- 不取消已进入处理的HTTP请求或已有SSE响应；新API请求被拒，已有WS会被关闭。
+- Session期限上限来自DSH实际原生Cookie寿命（默认30天）；更长寿命须后续人工调整DSH配置并重启，不能仅改浏览器Max-Age。
+- 内部地址是实际监听信息，不是绕过公开HTTPS认证的登录入口；无法取得可信真实客户端IP。
+- WS治理依赖已提供的WebServer.server和Node upgrade分发；DSH接口变更后需要重新验证。
 
 ## 实现要点（给想改代码的人）
 

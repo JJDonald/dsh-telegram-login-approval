@@ -1,3 +1,5 @@
+import { validateSetting } from './settings.ts'
+
 /**
  * 插件的配置类型与解析。
  *
@@ -24,6 +26,10 @@ export interface RawConfig {
   adminChatId?: number
   /** 一次批准请求的有效期（秒）。 */
   ttlSeconds?: number
+  /** 新Web会话有效期（整数天，不得超过DSH原生Cookie寿命）。 */
+  sessionDays?: number
+  /** 错误密钥10次/60秒后的全局冷却；与通知限流独立。 */
+  failureCooldownSeconds?: number
   /** 限流窗口（秒）。 */
   windowSeconds?: number
   /** 单个窗口内允许触发的次数上限。 */
@@ -47,6 +53,8 @@ export interface ResolvedConfig {
   botToken: string
   adminChatId: number
   ttlSeconds: number
+  sessionDays: number
+  failureCooldownSeconds: number
   windowSeconds: number
   maxTriggersPerWindow: number
   cooldownSeconds: number
@@ -106,16 +114,16 @@ export function resolveConfig(raw: RawConfig | undefined): ResolvedConfig {
   }
 
   const publicOrigin = cfg.publicOrigin ?? ''
-  if (!/^https:\/\/[a-z0-9.-]+$/.test(publicOrigin)) {
-    throw new ConfigError('publicOrigin 必须是配置的 HTTPS 公网域名 origin')
-  }
+  validateSetting('publicOrigin', publicOrigin, 30)
   const secretFile = cfg.secretFile ?? ''
   if (!secretFile.startsWith('/')) throw new ConfigError('secretFile 必须是 root-only 凭据的绝对路径')
   const botUsername = (cfg.botUsername ?? '').trim().replace(/^@/, '')
   if (botUsername !== '' && !/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(botUsername)) {
     throw new ConfigError(`botUsername "${botUsername}" 不是合法的 Telegram Bot 用户名`)
   }
-  if (cfg.ttlSeconds !== undefined && Number(cfg.ttlSeconds) !== 300) throw new ConfigError('浏览器批准 TTL 固定为300秒')
+  validateSetting('approvalSeconds', cfg.ttlSeconds ?? 300, 30)
+  validateSetting('failureCooldownSeconds', cfg.failureCooldownSeconds ?? 600, 30)
+  const sessionDays = positiveInt(cfg.sessionDays, 30, 'sessionDays')
   const dshHome = (process.env.DSH_HOME ?? '.').trim() || '.'
   return {
     publicOrigin,
@@ -124,6 +132,8 @@ export function resolveConfig(raw: RawConfig | undefined): ResolvedConfig {
     botToken: token,
     adminChatId,
     ttlSeconds: positiveInt(cfg.ttlSeconds, 300, 'ttlSeconds'),
+    sessionDays,
+    failureCooldownSeconds: positiveInt(cfg.failureCooldownSeconds, 600, 'failureCooldownSeconds'),
     windowSeconds: positiveInt(cfg.windowSeconds, 600, 'windowSeconds'),
     maxTriggersPerWindow: positiveInt(cfg.maxTriggersPerWindow, 3, 'maxTriggersPerWindow'),
     cooldownSeconds: positiveInt(cfg.cooldownSeconds, 600, 'cooldownSeconds'),

@@ -2,14 +2,15 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { readFileSync, statSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { ApprovalStore, hashToken, type PendingApproval } from './approvals.ts'
-import { TriggerLimiter } from './rate-limit.ts'
+import { TriggerLimiter, FailureLimiter } from './rate-limit.ts'
+import { SessionStore } from './sessions.ts'
+import { SettingsStore } from './settings.ts'
+import { savePrivate } from './persistence.ts'
 import { readHeader } from './util.ts'
 import { renderLoginPage, type LoginState } from './login-page.ts'
 
 const NONCE_COOKIE = '__Host-dsh-login'
 const CLEAR_NONCE = `${NONCE_COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict`
-const INPUT_WINDOW_MS = 60_000
-const MAX_INPUTS = 10
 const BODY_LIMIT = 4096
 
 export interface LoginConnection {
@@ -26,19 +27,20 @@ interface LoginOptions {
   original: AuthorizeIndex
   store: ApprovalStore
   limiter: TriggerLimiter
+  failures: FailureLimiter
+  sessions: SessionStore
+  settings: SettingsStore
   sendConfirmation(item: PendingApproval): Promise<void>
 }
 
 /** Secret Key 与 launch token 均仅留在服务内存，不作为页面内容或日志字段。 */
 export class WebLogin {
-  private readonly secret: Buffer
+  private secret: Buffer
   private readonly internalUrl: string
-  private inputStartedAt = 0
-  private inputs = 0
 
   constructor(private readonly options: LoginOptions) {
     const stat = statSync(options.secretFile)
-    if (stat.uid !== 0 || (stat.mode & 0o077) !== 0 || !stat.isFile()) {
+    if (stat.uid !== 0 || (stat.mode & 0o777) !== 0o600 || !stat.isFile()) {
       throw new Error('DSH Secret Key 文件必须为 root-only 普通文件')
     }
     this.secret = Buffer.from(readFileSync(options.secretFile, 'utf8').trim(), 'utf8')
@@ -49,6 +51,16 @@ export class WebLogin {
 
   /** 只供管理员主动私聊 /key 的既有白名单处理器调用。 */
   adminKey(): string { return this.secret.toString('utf8') }
+
+  resetKey(): void {
+    const next = randomBytes(32).toString('base64url')
+    const stat = statSync(this.options.secretFile)
+    if (stat.uid !== 0 || (stat.mode & 0o777) !== 0o600 || !stat.isFile() || process.getuid?.() !== 0) {
+      throw new Error('重置密钥需要root及600文件')
+    }
+    savePrivate(this.options.secretFile, next + '\n')
+    this.secret = Buffer.from(next, 'utf8')
+  }
 
   private trusted(req: IncomingMessage, post = false): boolean {
     if (readHeader(req.headers, 'host') !== new URL(this.options.origin).host) return false
@@ -112,12 +124,11 @@ export class WebLogin {
     if (!this.trusted(req, true)) { this.reject(res, 403); return }
     if (new URL(req.url!, this.options.origin).search !== '') { this.reject(res, 400); return }
     const now = Date.now()
-    if (now - this.inputStartedAt >= INPUT_WINDOW_MS) { this.inputStartedAt = now; this.inputs = 0 }
-    if (this.inputs >= MAX_INPUTS) {
-      res.setHeader('retry-after', String(Math.ceil((this.inputStartedAt + INPUT_WINDOW_MS - now) / 1000)))
-      this.html(req, res, 'rate-limited', 429); return
+    const retry = this.options.failures.check(now)
+    if (retry > 0) {
+      res.setHeader('retry-after', String(retry))
+      this.html(req, res, 'rate-limited', 429, `错误密钥全局冷却，约 ${retry} 秒后重试。`); return
     }
-    this.inputs += 1
     if (readHeader(req.headers, 'content-type').split(';')[0] !== 'application/x-www-form-urlencoded') {
       this.reject(res, 415); return
     }
@@ -130,6 +141,7 @@ export class WebLogin {
     const secrets = new URLSearchParams(body).getAll('secret')
     const supplied = Buffer.from(secrets.length === 1 ? secrets[0]! : '', 'utf8')
     if (supplied.length !== this.secret.length || !timingSafeEqual(supplied, this.secret)) {
+      this.options.failures.record(now)
       this.html(req, res, 'invalid', 401); return
     }
     const existingNonce = this.nonce(req)
@@ -147,7 +159,7 @@ export class WebLogin {
     void this.options.sendConfirmation(item)
     res.writeHead(303, {
       location: `/login/status?request=${item.id}`, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer',
-      'set-cookie': `${NONCE_COOKIE}=${nonce}; Max-Age=300; Path=/; Secure; HttpOnly; SameSite=Strict`,
+      'set-cookie': `${NONCE_COOKIE}=${nonce}; Max-Age=${Math.ceil((item.expiresAt - item.createdAt) / 1000)}; Path=/; Secure; HttpOnly; SameSite=Strict`,
     })
     res.end()
   }
@@ -171,13 +183,15 @@ export class WebLogin {
     // 消费在原同步签发之前完成，另一请求不能竞争重用同一次批准。
     this.options.store.consume(item.id)
     const writeHead = res.writeHead
+    const options = this.options
     res.writeHead = function (status: number, headers?: any): ServerResponse {
       if (status !== 303 || typeof headers?.['set-cookie'] !== 'string') {
         throw new Error('DSH 原认证未完成 Cookie 交换')
       }
       return writeHead.call(res, status, {
         ...headers, location: '/',
-        'set-cookie': [`${headers['set-cookie']}; Secure`, CLEAR_NONCE],
+        'set-cookie': [`${headers['set-cookie']}; Secure`, CLEAR_NONCE,
+          options.sessions.create(readHeader(req.headers, 'host'), item.userAgent, options.settings.value.sessionDays)],
       })
     } as typeof res.writeHead
     try {

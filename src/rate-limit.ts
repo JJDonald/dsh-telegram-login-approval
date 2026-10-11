@@ -66,3 +66,21 @@ export class TriggerLimiter {
     return this.buckets.size
   }
 }
+
+/** 错误密钥冷却：全局10次错误/60秒，正确输入不计数。旧冷却保留原截止时间。 */
+export class FailureLimiter {
+  private startedAt = 0
+  private failures = 0
+  private blockedUntil = 0
+  constructor(public cooldownSeconds: number) {}
+  check(now = Date.now()): number { return Math.max(0, Math.ceil((this.blockedUntil - now) / 1000)) }
+  record(now = Date.now()): void {
+    if (now - this.startedAt >= 60_000) { this.startedAt = now; this.failures = 0 }
+    this.failures += 1
+    if (this.failures >= 10) {
+      this.blockedUntil = now + this.cooldownSeconds * 1000
+      this.failures = 0
+      this.startedAt = now
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "dshBin": "/path/to/node_modules/@deepseek-ai/dsh/lib/bin.js",
+  "patch": "/path/to/telegram-overlay.yml",
+  "dataDir": "/path/to/dsh-home/storages/telegram-login-approval",
+  "host": "127.0.0.1",
+  "port": 3080,
+  "publicOrigin": "https://dsh.example.com"
+}

@@ -17,11 +17,14 @@
 import { ctxLogger } from './util.ts'
 import { ConfigError, resolveConfig, type RawConfig } from './config.ts'
 import { ApprovalStore, type PendingApproval } from './approvals.ts'
-import { TriggerLimiter } from './rate-limit.ts'
+import { TriggerLimiter, FailureLimiter } from './rate-limit.ts'
+import { SessionStore } from './sessions.ts'
+import { SettingsStore } from './settings.ts'
+import { WebPanel } from './web-panel.ts'
 import { OffsetStore, TelegramClient, type TgUpdate } from './telegram.ts'
 import { escapeHtml } from './page.ts'
 import { WebLogin, type LoginConnection } from './web-login.ts'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { IncomingMessage, ServerResponse, Server } from 'node:http'
 import { installTaskNotify } from './task-notify.ts'
 
 export const name = 'telegram-login-approval'
@@ -63,7 +66,6 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
     return
   }
 
-  const store = new ApprovalStore(config.ttlSeconds)
   const limiter = new TriggerLimiter(config.windowSeconds, config.maxTriggersPerWindow, config.cooldownSeconds)
   const client = new TelegramClient(config.botToken, (message) => { log.info(message) })
   const offsets = new OffsetStore(`${config.dataDir}/offset.json`)
@@ -84,19 +86,37 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
     throw new ConfigError('ctx.connection.requestRejection 不是函数，DSH 版本可能已变更')
   }
 
+  const webServer = (ctx as { webServer: {
+    host: string; port: number; server: Server
+    register(route: { kind: 'exact'; path: string; handler(req: IncomingMessage, res: ServerResponse): void | Promise<void> }): () => void
+  } }).webServer
+  const nativeAge = (connection.browserAuth as { maxAgeMilliseconds: number })?.maxAgeMilliseconds
+  if (!Number.isSafeInteger(nativeAge) || nativeAge < 86400_000 || !webServer.server || typeof webServer.server.emit !== 'function') {
+    throw new ConfigError('DSH browserAuth寿命或WebServer.server接口不符合要求')
+  }
+  const settings = new SettingsStore(`${config.dataDir}/web-settings.json`, {
+    host: webServer.host, port: webServer.port, publicOrigin: config.publicOrigin,
+    sessionDays: config.sessionDays, approvalSeconds: config.ttlSeconds,
+    failureCooldownSeconds: config.failureCooldownSeconds,
+  }, Math.floor(nativeAge / 86400_000))
+  // 网络配置以本次启动读取的值为准；运行中保存不改变当前origin/fence/listener。
+  const runtime = { host: webServer.host, port: webServer.port, publicOrigin: settings.value.publicOrigin }
+  const store = new ApprovalStore(settings.value.approvalSeconds)
+  const failures = new FailureLimiter(settings.value.failureCooldownSeconds)
+  const sessions = new SessionStore(`${config.dataDir}/web-sessions.json`)
   const login = new WebLogin({
-    origin: config.publicOrigin,
+    origin: runtime.publicOrigin,
     botUsername: config.botUsername,
     secretFile: config.secretFile,
     connection: connection as unknown as LoginConnection,
     original,
     store,
     limiter,
+    failures,
+    sessions,
+    settings,
     sendConfirmation,
   })
-  const webServer = (ctx as { webServer: { register(route: {
-    kind: 'exact'; path: string; handler(req: IncomingMessage, res: ServerResponse): void | Promise<void>
-  }): () => void } }).webServer
   for (const [path, handler] of [
     ['/login', login.login.bind(login)],
     ['/login/status', login.status.bind(login)],
@@ -121,7 +141,14 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
   if (protoDesc === undefined || typeof protoDesc.value !== 'function') {
     throw new ConfigError('无法定位 connection.authorizeIndex 的 prototype 描述符，DSH 版本可能已变更')
   }
-  const originalFromProto = protoDesc.value as AuthorizeIndexFn
+  const rejectionDesc = Object.getOwnPropertyDescriptor(proto, 'requestRejection')
+  if (!rejectionDesc || typeof rejectionDesc.value !== 'function') throw new ConfigError('无法定位requestRejection prototype')
+  const originalRejection = rejectionDesc.value as (req: { headers: unknown }) => number | undefined
+  Object.defineProperty(proto, 'requestRejection', { ...rejectionDesc, value: function (this: unknown, req: { headers: unknown }) {
+    const result = originalRejection.call(this, req)
+    return result ?? (sessions.find(req) ? undefined : 401)
+  } })
+  const disposeUpgrades = sessions.guardUpgrades(webServer.server, req => (connection as unknown as LoginConnection).requestRejection(req))
   // 以 prototype 上的实现为准：facade 上的方法可能是包装过的，原样调用最可靠。
   Object.defineProperty(proto, 'authorizeIndex', {
     value: patched,
@@ -129,16 +156,13 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
     configurable: true,
     enumerable: protoDesc.enumerable ?? false,
   })
-  log.info(`已包装 connection.authorizeIndex（prototype；ttl=${String(config.ttlSeconds)}s, dryRun=${String(config.dryRun)}）`)
+  log.info(`已包装 connection.authorizeIndex（prototype；ttl=${String(store.ttlSeconds)}s, dryRun=${String(config.dryRun)}）`)
 
   // 卸载时还原共享 prototype（ctx.effect 在 fiber dispose 时调用）。
   ctxEffect(ctx, () => {
-    Object.defineProperty(proto, 'authorizeIndex', {
-      value: originalFromProto,
-      writable: true,
-      configurable: true,
-      enumerable: protoDesc.enumerable ?? false,
-    })
+    disposeUpgrades()
+    Object.defineProperty(proto, 'requestRejection', rejectionDesc)
+    Object.defineProperty(proto, 'authorizeIndex', protoDesc)
     process.stdout.write('DSH_TELEGRAM_GATE_UNLOADED\n')
     log.info('已还原 connection.authorizeIndex')
   }, `${name}: restore authorizeIndex`)
@@ -148,6 +172,16 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
   // Telegram 确认与轮询
   // ---------------------------------------------------------------------
 
+  const panel = new WebPanel({
+    client, admin: config.adminChatId, botUsername: config.botUsername,
+    settings, sessions, runtime, pendingCount: () => store.pendingCount(),
+    key: () => login.adminKey(), resetKey: () => login.resetKey(),
+    changed: () => {
+      store.ttlSeconds = settings.value.approvalSeconds
+      failures.cooldownSeconds = settings.value.failureCooldownSeconds
+    },
+  })
+
   /** 发送确认卡片。 */
   async function sendConfirmation(item: PendingApproval): Promise<void> {
     const text = [
@@ -156,7 +190,7 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
       '有浏览器正在请求登录你的 DeepSeek Harness。',
       '',
       `请求编号：<code>${item.id.slice(0, 8)}</code>`,
-      `有效期：${String(config.ttlSeconds / 60)} 分钟`,
+      `有效期：${String((item.expiresAt - item.createdAt) / 1000)} 秒`,
       '',
       '如果不是你本人操作，请点「拒绝」。',
     ].join('\n')
@@ -180,6 +214,7 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
 
   /** 处理一条 update。 */
   async function handleUpdate(update: TgUpdate): Promise<void> {
+    if (await panel.handle(update)) return
     const callback = update.callback_query
     if (callback !== undefined) {
       await handleCallback(callback)
@@ -193,10 +228,10 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
       if (message.chat.type !== 'private' || message.chat.id !== config.adminChatId) return
       if (config.dryRun) return
       if (message.text.trim() === '/key' || (config.botUsername !== '' && message.text.trim() === `/key@${config.botUsername}`)) {
-        await client.sendMessage(config.adminChatId, `🔑 <b>DSH 独立 Secret Key</b>\n\n<code>${escapeHtml(login.adminKey())}</code>\n\n仅用于 ${escapeHtml(config.publicOrigin)} ，请勿分享。`)
+        await client.sendMessage(config.adminChatId, `🔑 <b>DSH 独立 Secret Key</b>\n\n<code>${escapeHtml(login.adminKey())}</code>\n\n仅用于 ${escapeHtml(runtime.publicOrigin)} ，请勿分享。`)
         return
       }
-      await client.sendMessage(config.adminChatId, '本 Bot 用于 DSH 登录确认与任务通知。获取独立 Secret Key 请发送 /key。')
+      await client.sendMessage(config.adminChatId, '本 Bot 用于 DSH 登录确认与任务通知。管理台请发送 /web，获取独立 Secret Key 请发送 /key。')
     }
   }
 
@@ -285,9 +320,9 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
         if (stopped) break
         try {
           await handleUpdate(update)
-        } catch (error) {
+        } catch {
           // 毒消息要 ack（记日志），否则会永远重试。
-          log.warn(`处理 update 失败（已跳过）: ${String(error)}`)
+          log.warn('处理 update 失败（已跳过；不记录消息、凭证或错误正文）')
         }
         offsets.advance(update.update_id)
       }

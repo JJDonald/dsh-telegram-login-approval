@@ -38,8 +38,18 @@
         #       head -c 32 /dev/urandom | base64 | tr -d '\n' > /etc/dsh/web-secret.key
         secretFile: '/etc/dsh/web-secret.key'
 
-        # 登录批准请求的有效期（秒）。当前固定为 300（只支持 300）。
+        # 新登录批准有效期：30–3600整数秒（nonce Cookie同步使用）。
         ttlSeconds: 300
+
+        # 新浏览器会话寿命：1–DSH原生cookieMaxAgeDays整数天（默认上限30）。
+        sessionDays: 30
+
+        # 错误密钥全局10次/60秒后冷却；60–86400整数秒。
+        # 与下面的Telegram确认通知触发限流不同。
+        failureCooldownSeconds: 600
+
+        # 使用 scripts/serve.ts 时必须与serve配置的dataDir一致。
+        # dataDir: '/path/to/dsh-home/storages/telegram-login-approval'
 
         # 触发限流：窗口秒数 / 窗口内最多触发次数 / 超限后的冷却秒数。
         windowSeconds: 600

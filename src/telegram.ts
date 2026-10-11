@@ -1,7 +1,8 @@
 /**
  * 极简 Telegram Bot 客户端（长轮询）。
  *
- * 只用 Node 内置能力：全局 `fetch` + `AbortController`。
+ * 只用 Node 内置能力：`node:https` + `AbortSignal`。
+ * 不走全局 fetch，避免同进程模型代理钩子记录带 Bot Token 的 URL。
  * 不引入任何 npm 依赖，因此可被 overlay 以绝对路径加载。
  *
  * 安全要点：
@@ -12,6 +13,7 @@
 
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { request } from 'node:https'
 
 /** Telegram Update 的最小结构（只声明用到的字段）。 */
 export interface TgUpdate {
@@ -21,6 +23,7 @@ export interface TgUpdate {
     chat: { id: number; type?: string }
     from?: { id: number }
     text?: string
+    reply_to_message?: { message_id: number }
   }
   callback_query?: {
     id: string
@@ -57,19 +60,37 @@ export class TelegramClient {
   /** 底层调用；任何异常都转为 { ok:false }，绝不向调用方抛网络错误。 */
   private async call(method: string, payload: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
     try {
-      const response = await fetch(`${this.apiBase}/${method}`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
-        ...(signal !== undefined ? { signal } : {}),
+      const body = JSON.stringify(payload)
+      const responseBody = await new Promise<string>((resolve, reject) => {
+        const req = request(`${this.apiBase}/${method}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': Buffer.byteLength(body),
+          },
+          ...(signal !== undefined ? { signal } : {}),
+        }, response => {
+          response.setEncoding('utf8')
+          let text = ''
+          response.on('data', (chunk: string) => { text += chunk })
+          response.on('end', () => { resolve(text) })
+          response.on('error', reject)
+        })
+        req.on('error', reject)
+        req.end(body)
       })
-      const json = await response.json() as Record<string, unknown>
+      const json = JSON.parse(responseBody) as Record<string, unknown>
+      // API 错误说明同样会被调用方记录，必须在传输边界脱敏。
+      if (typeof json.description === 'string') json.description = this.redact(json.description)
       return json
     } catch (error) {
-      // 绝不把 token 带进日志（apiBase 含 token，只记错误本身）。
       const reason = error instanceof Error ? error.message : String(error)
-      return { ok: false, description: `network: ${reason}` }
+      return { ok: false, description: `network: ${this.redact(reason)}` }
     }
+  }
+
+  private redact(text: string): string {
+    return text.replaceAll(this.token, '[REDACTED]')
   }
 
   /** 取本 Bot 身份，用于启动自检。 */
@@ -87,7 +108,8 @@ export class TelegramClient {
   async sendMessage(
     chatId: number,
     text: string,
-    buttons: readonly InlineButton[] = [],
+    buttons: readonly InlineButton[] | readonly (readonly InlineButton[])[] = [],
+    forceReply = false,
   ): Promise<SendResult> {
     const payload: Record<string, unknown> = {
       chat_id: chatId,
@@ -97,9 +119,11 @@ export class TelegramClient {
     }
     if (buttons.length > 0) {
       payload.reply_markup = {
-        inline_keyboard: [buttons.map(b => ({ text: b.text, callback_data: b.callbackData }))],
+        inline_keyboard: (Array.isArray(buttons[0]) ? buttons as readonly (readonly InlineButton[])[] : [buttons as readonly InlineButton[]])
+          .map(row => row.map(b => ({ text: b.text, callback_data: b.callbackData }))),
       }
     }
+    if (forceReply) payload.reply_markup = { force_reply: true, selective: true }
     const res = await this.call('sendMessage', payload)
     const result = res.result as { message_id?: number } | undefined
     return {

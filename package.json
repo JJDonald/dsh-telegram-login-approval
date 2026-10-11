@@ -20,6 +20,8 @@
   "files": [
     "src",
     "cordis.example.yml",
+    "scripts",
+    "docs/web-console.md",
     "README.md",
     "LICENSE"
   ],

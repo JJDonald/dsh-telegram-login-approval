@@ -2,7 +2,7 @@
  * 待批准请求的存储（仅内存）。
  *
  * 刻意不持久化：进程重启后未决批准全部丢失 = fail-closed。
- * 这与 DSH 自身的立场一致（它也没有 logout，靠重启撤销会话）。
+ * 浏览器登录会话另由 SessionStore 持久化，不计入此表。
  */
 import { createHash, randomUUID } from 'node:crypto'
 
@@ -48,7 +48,7 @@ export class ApprovalStore {
   private readonly byId = new Map<string, PendingApproval>()
   private readonly byTokenHash = new Map<string, string>()
 
-  constructor(private readonly ttlSeconds: number) {}
+  constructor(public ttlSeconds: number) {}
 
   /** 清理过期条目并回收内存。 */
   private sweep(now: number): void {
@@ -146,6 +146,11 @@ export class ApprovalStore {
       this.byTokenHash.delete(item.tokenHash)
     }
     this.byId.delete(id)
+  }
+
+  pendingCount(): number {
+    this.sweep(Date.now())
+    return [...this.byId.values()].filter(s => s.status === 'pending').length
   }
 
   /** 供诊断使用。 */
