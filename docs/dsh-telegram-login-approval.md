@@ -3,7 +3,13 @@
 > 目标：把 openbear 的「静态密钥 + Telegram 二次确认」搬进 DeepSeek Harness，
 > 以**单个插件**形式实现，不改 DSH 源码。
 >
-> 状态：规格（待实施）。所有技术断言均已在 DSH `master` 源码中核实，附代码位置。
+> 状态：**规格（历史设计文档，M1）**。所有技术断言均已在 DSH `master` 源码中核实，附代码位置。
+>
+> ⚠️ **本文描述的 M1「启动 token 门禁」方案已被实际实现取代。**
+> 已发布的 v0.2 不再使用 URL 里的 `?token=`，而是改为**长期 Secret Key + 浏览器 nonce cookie +
+> 单次凭证交换**（见 [`../README.md`](../README.md)）。带 `token` 查询参数的请求现在被明确拒绝（401）。
+> 保留本文是因为其中关于 DSH 认证机制、反代、限流与 webServer 路由接缝的技术核实仍然准确且有用。
+> 二者的差异对照见文末「[附录 A](#附录-a已发布实现与-m1-规格的差异)」。
 
 ---
 
@@ -522,3 +528,32 @@ cd dsh && node --import tsx/esm ../opendsh/tests/task-watch.test.mts
 - **Linux 部署与反代验收**：尚未做（本机为 Windows）。
 - **`/api/*` 与 WebSocket 完整回归**：未逐项比对（门禁只包 `authorizeIndex`，
   理论上不影响，但未实测）。
+
+---
+
+## 附录 A：已发布实现与 M1 规格的差异
+
+本附录记录**实际发布**的 v0.2 实现（`src/`）与本规格（M1）的关键分歧。
+代码是权威来源；本规格中与实现冲突之处一律以代码为准。
+
+| 维度 | M1 规格（本文档） | 已发布实现（v0.2） |
+|---|---|---|
+| 登录入口 | `GET /?token=<launchToken>` 作为门禁信号 | `GET /` 返回登录表单；`POST /login` 提交 **Secret Key** |
+| 凭证来源 | 沿用 DSH 每进程随机 launch token | 独立的**长期 Secret Key 文件**（43 字符 base64，root-only 600） |
+| 浏览器绑定 | 无 | `__Host-dsh-login` **nonce cookie**（`Secure` / `HttpOnly` / `SameSite=Strict`） |
+| 批准后行为 | 直接放行原 token 交换 | **单次消费**批准，拦截 DSH `writeHead` 校验 303 + `Set-Cookie` 后改写 `location='/'` |
+| 重放 | 未处理 | 批准不可重放；再次访问等待页 → 401 |
+| 旧 token 参数 | 门禁入口 | **明确拒绝（401）**，不再进入批准流程 |
+| 路由 | 包装 `authorizeIndex` | 同左，另加 exact 路由 `/login` 与 `/login/status` |
+| 私人标识 | 硬编码本部署 Bot / 域名 | `publicOrigin` + `botUsername` **配置项**，源码零硬编码 |
+| 拒绝 / 过期 | 未明确 | 403 / 410，页面区分状态 |
+| 限流 | 提及 per-IP 不可信 | 全局单键 `'global'`：POST 60s/10 次，批准触发沿用 `TriggerLimiter` |
+| 测试 | 门禁 9 用例 | gate **18** 用例 + task-watch **12** 用例 = **30** |
+
+**保持不变的部分**（本规格的技术核实依然有效）：DSH 认证机制分析（§1）、
+webServer 精确路由优先于 fallback（§2）、反代与 Host/Origin 栅栏、
+`authorizeIndex` 无服务端副作用的前提、任务段静置窗口（`SETTLE_MS = 800ms`）聚合逻辑、
+以及断言「必须修改共享 prototype 而非实例」。
+
+**仍未完成**（两个模型共同）：`/revoke` 会话撤销、真实 Telegram 端到端、
+Linux + 反代现场验收。

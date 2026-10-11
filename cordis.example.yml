@@ -24,7 +24,21 @@
         # 下面的值是占位示例，务必改成你自己的。
         adminChatId: 123456789
 
-        # 登录批准请求的有效期（秒）。
+        # 本部署唯一的公开 HTTPS origin（必填）。登录页与确认卡片都以此为信任边界，
+        # 也是 `/key` 提示与 Host 校验的基准。不要带结尾斜杠、不要带路径。
+        publicOrigin: 'https://dsh.example.com'
+
+        # Bot 用户名（不含 @）。可选：仅用于登录页提示文案与 `/key@<bot>` 群组指令匹配。
+        # 留空时页面自动降级为通用文案（不硬编码任何某一部署的 Bot）。
+        botUsername: 'example_bot'
+
+        # 持久 Secret Key 文件的绝对路径（必填）。必须存在且为 root-only 普通文件
+        # （owner=root，权限 600）；插件启动时会强制校验，不满足直接抛错。
+        # 生成：install -m 600 /dev/null /etc/dsh/web-secret.key
+        #       head -c 32 /dev/urandom | base64 | tr -d '\n' > /etc/dsh/web-secret.key
+        secretFile: '/etc/dsh/web-secret.key'
+
+        # 登录批准请求的有效期（秒）。当前固定为 300（只支持 300）。
         ttlSeconds: 300
 
         # 触发限流：窗口秒数 / 窗口内最多触发次数 / 超限后的冷却秒数。

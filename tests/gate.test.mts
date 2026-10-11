@@ -1,73 +1,126 @@
 /**
- * M1 集成验证：用假的 Cordis ctx 驱动完整门禁流程。
+ * 集成验证：用假的 Cordis ctx + 假的 Telegram API 驱动完整的登录门禁流程。
  *
  * 为什么需要这个测试：真实 `dsh web` 跑通需要真实 Telegram Bot，
- * 而**安全关键路径**（批准→凭证交换、以及「批准了但 token 错仍拒绝」的双保险）
- * 必须被验证。这里用一个最小 fake ctx 直接驱动插件的 `apply`。
+ * 而**安全关键路径**必须被验证：
+ *   Secret Key 校验 → 生成带外批准 → Telegram 批准/拒绝 → 单次凭证交换 → 不可重放。
+ * 这里用一个最小 fake ctx 直接驱动插件的 `apply`，并用假的 `fetch` 喂 Telegram update。
  *
  * 运行：
  *   cd dsh && node --import tsx/esm ../opendsh/tests/gate.test.mts
  */
 
 import { strict as assert } from 'node:assert'
-import { mkdtempSync } from 'node:fs'
+import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { resolveConfig } from '../src/config.ts'
 
 // 让插件把 offset 写到临时目录，避免污染。
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'tla-test-'))
-// 屏蔽真实网络：探针模式下不应发起任何 Telegram 调用。
-const realFetch = globalThis.fetch
-let fetchCalls = 0
-globalThis.fetch = (async () => {
-  fetchCalls += 1
-  return new Response(JSON.stringify({ ok: false, description: 'blocked in test' }), { status: 200 })
+process.env.TLA_TEST_TOKEN = '123456:TEST_TOKEN_FOR_UNIT_TESTS'
+
+const ORIGIN = 'https://test.example.com'
+const ADMIN = 123456789
+const SECRET = 'A'.repeat(43)
+const TG_MESSAGE_ID = 42
+
+const secretDir = mkdtempSync(join(tmpdir(), 'tla-secret-'))
+const secretFile = join(secretDir, 'secret.key')
+writeFileSync(secretFile, SECRET, { mode: 0o600 })
+chmodSync(secretFile, 0o600)
+
+// ---------------------------------------------------------------------------
+// 假 Telegram API
+// ---------------------------------------------------------------------------
+
+interface TgUpdate {
+  update_id: number
+  message?: { message_id: number; chat: { id: number; type?: string }; from?: { id: number }; text?: string }
+  callback_query?: {
+    id: string
+    from: { id: number }
+    data?: string
+    message?: { message_id: number; chat: { id: number; type?: string } }
+  }
+}
+
+const tg = { sendMessage: 0, getUpdates: 0, unknown: 0, texts: [] as string[] }
+const queue: TgUpdate[] = []
+let firstUpdatesDone = false
+
+function json(value: unknown): Response {
+  return new Response(JSON.stringify(value), { status: 200, headers: { 'content-type': 'application/json' } })
+}
+
+globalThis.fetch = (async (input: unknown, init?: { body?: unknown }) => {
+  const url = String(typeof input === 'string' ? input : (input as { url: string }).url)
+  const method = url.slice(url.lastIndexOf('/') + 1)
+  const payload = init?.body === undefined ? {} : JSON.parse(String(init.body)) as Record<string, unknown>
+  switch (method) {
+    case 'getMe':
+      return json({ ok: true, result: { username: 'testbot' } })
+    case 'sendMessage':
+      tg.sendMessage += 1
+      tg.texts.push(String(payload.text ?? ''))
+      return json({ ok: true, result: { message_id: TG_MESSAGE_ID } })
+    case 'editMessageText':
+    case 'answerCallbackQuery':
+      return json({ ok: true, result: true })
+    case 'getUpdates': {
+      tg.getUpdates += 1
+      if (!firstUpdatesDone) {
+        // 首次运行：返回空批次，让插件快进历史积压。
+        firstUpdatesDone = true
+        return json({ ok: true, result: [] })
+      }
+      // 之后的每一次调用都等待测试推入一条 update。
+      while (queue.length === 0) await new Promise<void>(r => setTimeout(r, 5))
+      return json({ ok: true, result: [queue.shift()!] })
+    }
+    default:
+      tg.unknown += 1
+      return json({ ok: true, result: true })
+  }
 }) as typeof fetch
 
 const mod = await import('../src/index.ts')
 
 // ---------------------------------------------------------------------------
-// Fake Cordis ctx
+// Fake Cordis ctx（复现 DSH 的 facade + prototype 语义）
 // ---------------------------------------------------------------------------
 
 interface Written {
   status: number
-  headers: Record<string, string>
+  headers: Record<string, unknown>
   body: string
 }
 
-/** 服务实现放在共享 prototype 上，复现 DSH 的 facade 行为。 */
+/** 服务实现放在共享 prototype 上：DSH 的 facade 每次访问都返回新对象。 */
 class FakeConnection {
-  /** 有效 token（模拟 launch token）。 */
-  static validToken = 'VALID_TOKEN_abcdefghijklmnop'
-  /** 已认证的会话标记（模拟有效 cookie）。 */
-  static authenticated = false
-  /** 记录 authorizeIndex 被真正调用的次数（凭证交换次数）。 */
+  /** 记录原 authorizeIndex 被真正调用的次数（即凭证交换次数）。 */
   static exchanges = 0
 
   requestRejection(_req: { headers: unknown }): number | undefined {
-    return FakeConnection.authenticated ? undefined : 401
+    // 未认证：返回 401，门禁据此渲染登录表单。
+    return 401
   }
 
-  authorizeIndex(req: { url?: string | undefined }, res: { writeHead(s: number, h?: Record<string, string>): void; end(b?: string): void }): boolean {
-    const url = new URL(req.url ?? '/', 'http://fake.invalid')
-    const token = url.searchParams.getAll('token').join('')
-    if (token !== '' && token === FakeConnection.validToken) {
-      FakeConnection.exchanges += 1
-      res.writeHead(303, { 'set-cookie': 'fake-session=v1.signed' })
-      res.end()
-      return false
-    }
-    res.writeHead(401)
+  authorizeIndex(_req: { url?: string }, res: { writeHead(s: number, h?: Record<string, string>): void; end(b?: string): void }): boolean {
+    FakeConnection.exchanges += 1
+    res.writeHead(303, { 'set-cookie': 'fake-session=v1.signed' })
     res.end()
     return false
   }
+
+  authenticatedUrl(base: string): string {
+    return new URL('/__dsh_authenticated', base).toString()
+  }
 }
 
-/** 记录所有日志，便于断言（真实 DSH 日志不落 stdout）。 */
 const logs: string[] = []
-
 const effects: Array<() => void> = []
+const routes = new Map<string, (req: unknown, res: unknown) => unknown>()
 
 function makeCtx(): unknown {
   const connection = new FakeConnection()
@@ -83,39 +136,130 @@ function makeCtx(): unknown {
       const d = fn()
       if (typeof d === 'function') effects.push(d)
     },
+    on: (_name: string, _fn: (...args: unknown[]) => void) => () => { /* 取消订阅 */ },
+    webServer: {
+      register: (route: { path: string; handler: (req: unknown, res: unknown) => unknown }) => {
+        routes.set(route.path, route.handler)
+        return () => { routes.delete(route.path) }
+      },
+    },
   }
 }
 
-function makeRes(): { res: Written; raw: unknown } {
+// ---------------------------------------------------------------------------
+// 假的请求 / 响应
+// ---------------------------------------------------------------------------
+
+function makeRes(): { written: Written; raw: Record<string, unknown> } {
   const written: Written = { status: 0, headers: {}, body: '' }
-  const raw = {
+  const raw: Record<string, unknown> = {
     statusCode: 200,
     headersSent: false,
     writableEnded: false,
-    writeHead(status: number, headers?: Record<string, string>): void {
+    destroyed: false,
+    setHeader(name: string, value: unknown): void { written.headers[name.toLowerCase()] = value },
+    writeHead(status: number, headers?: Record<string, unknown>): void {
       written.status = status
-      written.headers = headers ?? {}
-      ;(this as { statusCode: number }).statusCode = status
-      ;(this as { headersSent: boolean }).headersSent = true
+      for (const [k, v] of Object.entries(headers ?? {})) written.headers[k.toLowerCase()] = v
+      raw.statusCode = status
+      raw.headersSent = true
     },
-    end(body?: string): void {
-      written.body = body ?? ''
-      ;(this as { writableEnded: boolean }).writableEnded = true
+    end(body?: unknown): void {
+      written.body = typeof body === 'string' ? body : body === undefined ? '' : String(body)
+      raw.writableEnded = true
     },
+    resume(): void { /* body 已完整提供 */ },
   }
-  return { res: written, raw }
+  return { written, raw }
 }
 
-function request(token: string | null, ip = '10.0.0.1'): { req: unknown; out: Written } {
-  const url = token === null ? '/' : `/?token=${encodeURIComponent(token)}`
-  const req = { method: 'GET', url, headers: { 'user-agent': 'test-agent', host: 'x' } }
-  const { res, raw } = makeRes()
+function makeReq(
+  method: string,
+  url: string,
+  headers: Record<string, string> = {},
+  body?: string,
+): Record<string, unknown> {
+  const merged: Record<string, string> = { host: 'test.example.com', 'user-agent': 'tla-test', ...headers }
+  if (body !== undefined) {
+    merged['content-type'] = 'application/x-www-form-urlencoded'
+    merged['content-length'] = String(Buffer.byteLength(body))
+  }
+  return {
+    method,
+    url,
+    headers: merged,
+    destroyed: false,
+    resume(): void { /* 无实际 socket */ },
+    iterator(): AsyncGenerator<Buffer> {
+      const chunks = body === undefined ? [] : [Buffer.from(body)]
+      return (async function* () { for (const chunk of chunks) yield chunk })()
+    },
+  }
+}
+
+/** 走真实的 prototype 调用路径（与 DSH 的调用方式一致）。 */
+function request(method: string, url: string, headers: Record<string, string> = {}, body?: string): Written {
+  const { written, raw } = makeRes()
   const connection = new FakeConnection()
-  // 通过 prototype 调用被包装的方法（与 DSH 的真实调用路径一致）。
-  ;(Object.getPrototypeOf(connection) as { authorizeIndex: Function })
-    .authorizeIndex.call(connection, req, raw)
-  void ip
-  return { req, out: res }
+  ;(Object.getPrototypeOf(connection) as { authorizeIndex: (...a: unknown[]) => unknown })
+    .authorizeIndex.call(connection, makeReq(method, url, headers), raw)
+  return written
+}
+
+async function callRoute(path: string, method: string, url: string, headers: Record<string, string> = {}, body?: string): Promise<Written> {
+  const handler = routes.get(path)
+  if (handler === undefined) throw new Error(`路由未注册: ${path}`)
+  const { written, raw } = makeRes()
+  await handler(makeReq(method, url, headers, body), raw)
+  return written
+}
+
+async function postLogin(cookie?: string, secret = SECRET): Promise<Written> {
+  const headers: Record<string, string> = { origin: ORIGIN, 'sec-fetch-site': 'same-origin' }
+  if (cookie !== undefined) headers.cookie = cookie
+  return callRoute('/login', 'POST', '/login', headers, new URLSearchParams({ secret }).toString())
+}
+
+async function getStatus(cookie: string, requestId: string): Promise<Written> {
+  return callRoute('/login/status', 'GET', `/login/status?request=${requestId}`, { cookie })
+}
+
+function cookieOf(out: Written): string {
+  const raw = String(out.headers['set-cookie'] ?? '')
+  const value = /__Host-dsh-login=([A-Za-z0-9_-]+)/.exec(raw)?.[1]
+  if (value === undefined) throw new Error(`响应未设置 nonce cookie: ${raw}`)
+  return `__Host-dsh-login=${value}`
+}
+
+function requestIdOf(out: Written): string {
+  const location = String(out.headers.location ?? '')
+  const id = new URL(location, ORIGIN).searchParams.get('request')
+  if (id === null || id === '') throw new Error(`响应未带 request id: ${location}`)
+  return id
+}
+
+const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
+
+/** 轮询状态页直到出现期望状态码（批准/拒绝是异步经长轮询送达的）。 */
+async function pollStatus(cookie: string, requestId: string, want: number, tries = 150): Promise<Written> {
+  let out = await getStatus(cookie, requestId)
+  for (let i = 0; i < tries && out.status !== want; i += 1) {
+    await sleep(20)
+    out = await getStatus(cookie, requestId)
+  }
+  return out
+}
+
+function callbackUpdate(id: string, data: string, from = ADMIN): TgUpdate {
+  return {
+    update_id: Math.floor(Math.random() * 1_000_000),
+    callback_query: {
+      id: `cb-${id.slice(0, 6)}`,
+      from: { id: from },
+      data,
+      message: { message_id: TG_MESSAGE_ID, chat: { id: from, type: 'private' } },
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -123,84 +267,154 @@ function request(token: string | null, ip = '10.0.0.1'): { req: unknown; out: Wr
 // ---------------------------------------------------------------------------
 
 const results: Array<{ name: string; ok: boolean; detail: string }> = []
-function check(name: string, fn: () => void): void {
+
+async function check(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
-    fn()
+    await fn()
     results.push({ name, ok: true, detail: '' })
   } catch (error) {
     results.push({ name, ok: false, detail: error instanceof Error ? error.message : String(error) })
   }
 }
 
-console.log('=== M1 集成验证（fake ctx）===\n')
+console.log('=== 登录门禁集成验证（fake ctx + fake Telegram）===\n')
 
-// --- 基础：加载 ---
 const ctx = makeCtx()
-check('插件 apply 成功执行', () => {
-  mod.apply(ctx, { enabled: true, adminChatId: 123456789, dryRun: true, ttlSeconds: 300 })
+
+await check('插件 apply 成功执行', () => {
+  mod.apply(ctx, {
+    enabled: true,
+    adminChatId: ADMIN,
+    dryRun: false,
+    publicOrigin: ORIGIN,
+    botUsername: 'testbot',
+    secretFile,
+    botTokenRef: 'TLA_TEST_TOKEN',
+  })
   assert.ok(logs.some(l => l.includes('已包装 connection.authorizeIndex')), '未记录包装日志')
+  assert.ok(logs.some(l => l.includes('已订阅 session/event')), '任务通知未订阅')
+  assert.ok(routes.has('/login') && routes.has('/login/status'), '登录路由未注册')
 })
 
-// --- 关键：prototype 补丁确实生效 ---
-check('prototype 补丁生效（新 facade 也命中）', () => {
-  const fresh = new FakeConnection()
-  const patched = (Object.getPrototypeOf(fresh) as { authorizeIndex: { name: string } }).authorizeIndex
+await check('prototype 补丁生效（新 facade 也命中）', () => {
+  const patched = (Object.getPrototypeOf(new FakeConnection()) as { authorizeIndex: { name: string } }).authorizeIndex
   assert.equal(patched.name, 'patched', `期望 patched，实际 ${patched.name}`)
 })
 
-// --- 无 token：保持 DSH 原 401 ---
-check('无 token → 401（不接管）', () => {
-  const { out } = request(null)
-  assert.equal(out.status, 401, `期望 401，实际 ${out.status}`)
-})
-
-// --- 无效 token：401，且不触发门禁（防通知轰炸）---
-check('无效 token → 401（不进入门禁）', () => {
-  const { out } = request('TOTALLY_WRONG_TOKEN')
-  assert.equal(out.status, 401, `期望 401，实际 ${out.status}`)
-  assert.ok(!out.body.includes('等待手机确认'), '无效 token 不应显示等待页')
-})
-
-// --- 有效 token 首次：门禁等待页 ---
-check('有效 token 首次 → 200 等待页', () => {
-  const { out } = request(FakeConnection.validToken)
+await check('未认证 GET / → 200 登录表单（不落入 DSH 的 401）', () => {
+  const out = request('GET', '/')
   assert.equal(out.status, 200, `期望 200，实际 ${out.status}`)
-  assert.ok(out.body.includes('等待手机确认'), '应返回等待页')
+  assert.ok(out.body.includes('Secret Key'), '应包含 Secret Key 输入')
+  assert.ok(out.body.includes('@testbot'), '提示文案应使用配置的 botUsername')
+  // 源码不应硬编码任何具体部署的 Bot：页面只呈现配置值。
+  assert.ok(!out.body.includes('@dsh'), '不应残留硬编码 Bot 用户名')
 })
 
-// --- 复用：同一 token 反复访问不新建 pending ---
-check('同一 token 重复访问复用 pending（不轰炸通知）', () => {
-  const first = request(FakeConnection.validToken).out.body
-  const second = request(FakeConnection.validToken).out.body
-  const id = (s: string) => /请求编号 ([a-f0-9]{8})/.exec(s)?.[1] ?? ''
-  assert.ok(id(first) !== '', '首次应含请求编号')
-  assert.equal(id(first), id(second), '重复访问应复用同一请求编号')
+await check('【安全】旧 launch token 查询参数被明确拒绝（401）', () => {
+  const out = request('GET', '/?token=LEGACY_LAUNCH_TOKEN')
+  assert.equal(out.status, 401, `期望 401，实际 ${out.status}`)
 })
 
-// --- 关键安全性质：批准后仍要过 token 校验 ---
-check('【安全】已批准 + 有效 token → 交换凭证（303）', () => {
-  // 直接驱动 store 无法访问（闭包），改为模拟：把连接标记为「已批准」不可行，
-  // 因此用另一种等价方式验证 —— 通过 TG callback 路径需要真实 API。
-  // 这里改为验证「授权会话」路径：authenticated=true 时直通原流程。
-  FakeConnection.authenticated = true
-  FakeConnection.exchanges = 0
-  const { out } = request(FakeConnection.validToken)
-  assert.equal(FakeConnection.exchanges, 1, '已认证请求应触发一次凭证交换')
+await check('错误 Secret Key → 401 且不发送任何 Telegram 通知', async () => {
+  const before = tg.sendMessage
+  const out = await postLogin(undefined, 'B'.repeat(43))
+  assert.equal(out.status, 401, `期望 401，实际 ${out.status}`)
+  assert.ok(out.body.includes('Secret Key 不正确'), '应返回密钥错误页')
+  assert.equal(tg.sendMessage, before, '错误密钥不应触发确认卡片')
+})
+
+let cookie = ''
+let requestId = ''
+await check('正确 Secret Key → 303 到等待页并下发 nonce cookie', async () => {
+  const before = tg.sendMessage
+  const out = await postLogin()
   assert.equal(out.status, 303, `期望 303，实际 ${out.status}`)
-  FakeConnection.authenticated = false
+  cookie = cookieOf(out)
+  requestId = requestIdOf(out)
+  const setCookie = String(out.headers['set-cookie'])
+  assert.ok(setCookie.includes('Secure') && setCookie.includes('HttpOnly') && setCookie.includes('SameSite=Strict'), `cookie 属性不足: ${setCookie}`)
+  assert.equal(tg.sendMessage, before + 1, '应发送一条确认卡片')
 })
 
-// --- 静态资源不受影响 ---
-check('静态资源路径不被门禁影响', () => {
-  // 门禁只包装 authorizeIndex，静态资源走另一条路径（serveStatic 非 index 分支）。
-  // 这里断言：包装后 prototype 上仍只有 authorizeIndex 被替换，其他方法完好。
-  const proto = Object.getPrototypeOf(new FakeConnection()) as Record<string, unknown>
-  assert.equal(typeof proto.requestRejection, 'function', 'requestRejection 应完好')
+await check('等待页显示请求编号且自动刷新', async () => {
+  const out = await getStatus(cookie, requestId)
+  assert.equal(out.status, 200, `期望 200，实际 ${out.status}`)
+  assert.ok(out.body.includes('等待 Telegram 确认'), '应返回等待页')
+  assert.ok(out.body.includes('请求编号'), '等待页应含请求编号')
+  assert.ok(out.body.includes('http-equiv="refresh"'), '等待页应自动刷新')
 })
 
-// --- 卸载还原 ---
-check('卸载后还原原型方法', () => {
-  for (const d of effects) d()
+await check('重复提交复用同一请求（不轰炸通知）', async () => {
+  const before = tg.sendMessage
+  const out = await postLogin(cookie)
+  assert.equal(out.status, 303, `期望 303，实际 ${out.status}`)
+  assert.equal(requestIdOf(out), requestId, '应复用同一请求编号')
+  assert.equal(tg.sendMessage, before, '重复提交不应再发确认卡片')
+})
+
+await check('【安全】非白名单 Telegram 用户无法批准', async () => {
+  queue.push(callbackUpdate(requestId, `tla:approve:${requestId}`, 999))
+  await sleep(60)
+  const out = await getStatus(cookie, requestId)
+  assert.equal(out.status, 200, `非白名单批准后仍应等待，实际 ${out.status}`)
+  assert.ok(logs.some(l => l.includes('忽略非白名单 callback')), '应记录忽略日志')
+})
+
+await check('【安全】Telegram 批准 → 单次交换 DSH 凭证（303 → /）', async () => {
+  queue.push(callbackUpdate(requestId, `tla:approve:${requestId}`))
+  const out = await pollStatus(cookie, requestId, 303)
+  assert.equal(out.status, 303, `期望 303，实际 ${out.status}`)
+  assert.equal(out.headers.location, '/', '应重定向到根路径')
+  const setCookie = out.headers['set-cookie'] as string[]
+  assert.ok(Array.isArray(setCookie), '应同时写入会话与清理 nonce 两个 cookie')
+  assert.ok(String(setCookie[0]).includes('; Secure'), '会话 cookie 应追加 Secure')
+  assert.ok(String(setCookie[1]).includes('__Host-dsh-login=;'), '应清除 nonce cookie')
+})
+
+await check('【安全】批准不可重放：再次访问等待页被拒', async () => {
+  const out = await getStatus(cookie, requestId)
+  assert.equal(out.status, 401, `期望 401，实际 ${out.status}`)
+})
+
+await check('Telegram 拒绝 → 403 且不发凭证', async () => {
+  const created = await postLogin()
+  const denyCookie = cookieOf(created)
+  const denyId = requestIdOf(created)
+  queue.push(callbackUpdate(denyId, `tla:deny:${denyId}`))
+  const out = await pollStatus(denyCookie, denyId, 403)
+  assert.equal(out.status, 403, `期望 403，实际 ${out.status}`)
+  assert.ok(out.body.includes('登录已被拒绝'), '应返回拒绝页')
+})
+
+// ---------------------------------------------------------------------------
+// 配置校验（隐私改造：publicOrigin / botUsername 必须来自配置）
+// ---------------------------------------------------------------------------
+
+const base = { adminChatId: ADMIN, dryRun: true, publicOrigin: ORIGIN, secretFile }
+
+await check('配置：缺少 adminChatId 抛错', () => {
+  assert.throws(() => resolveConfig({ dryRun: true, publicOrigin: ORIGIN, secretFile }), /adminChatId/)
+})
+
+await check('配置：非 HTTPS publicOrigin 抛错', () => {
+  assert.throws(() => resolveConfig({ ...base, publicOrigin: 'http://test.example.com' }), /publicOrigin/)
+})
+
+await check('配置：非法 botUsername 抛错', () => {
+  assert.throws(() => resolveConfig({ ...base, botUsername: 'a' }), /botUsername/)
+})
+
+await check('配置：botUsername 去掉前导 @ 并规范化', () => {
+  assert.equal(resolveConfig({ ...base, botUsername: '@TestBot' }).botUsername, 'TestBot')
+  assert.equal(resolveConfig({ ...base, botUsername: '' }).botUsername, '', '未配置时应为空串')
+})
+
+await check('配置：浏览器批准 TTL 固定为 300 秒', () => {
+  assert.throws(() => resolveConfig({ ...base, ttlSeconds: 60 }), /TTL/)
+})
+
+await check('卸载后还原原型方法', () => {
+  for (const dispose of effects) dispose()
   const proto = Object.getPrototypeOf(new FakeConnection()) as { authorizeIndex: { name: string } }
   assert.equal(proto.authorizeIndex.name, 'authorizeIndex', '应还原为原方法')
 })
@@ -208,7 +422,6 @@ check('卸载后还原原型方法', () => {
 // ---------------------------------------------------------------------------
 // 汇总
 // ---------------------------------------------------------------------------
-globalThis.fetch = realFetch
 
 let failed = 0
 for (const r of results) {
@@ -216,5 +429,5 @@ for (const r of results) {
   if (!r.ok) failed += 1
 }
 console.log(`\n通过 ${String(results.length - failed)}/${String(results.length)}`)
-console.log(`（测试期间 fetch 调用次数：${String(fetchCalls)}，dryRun 下应为 0）`)
+console.log(`（Telegram 调用：sendMessage=${String(tg.sendMessage)} getUpdates=${String(tg.getUpdates)} 未知=${String(tg.unknown)}）`)
 process.exit(failed === 0 ? 0 : 1)

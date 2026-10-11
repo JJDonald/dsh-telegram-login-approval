@@ -10,6 +10,12 @@
 export interface RawConfig {
   /** 总开关；false 时插件完全不包装 authorizeIndex（等价于未安装）。 */
   enabled?: boolean
+  /** 唯一公开 HTTPS origin。 */
+  publicOrigin?: string
+  /** Bot 用户名（不含 @）；仅用于页面提示文案与 `/key` 指令匹配，可选。 */
+  botUsername?: string
+  /** root-only 持久 Secret Key 文件。 */
+  secretFile?: string
   /** 凭据名（环境变量名），用于解析 Telegram Bot Token。 */
   botTokenRef?: string
   /** 直接给 Bot Token（不推荐；优先用 botTokenRef）。 */
@@ -34,6 +40,10 @@ export interface RawConfig {
 
 /** 校验并补默认值后的运行时配置。 */
 export interface ResolvedConfig {
+  publicOrigin: string
+  /** 规范化后的 Bot 用户名（无 @）；未配置时为空串，页面提示自动降级为通用文案。 */
+  botUsername: string
+  secretFile: string
   botToken: string
   adminChatId: number
   ttlSeconds: number
@@ -95,8 +105,22 @@ export function resolveConfig(raw: RawConfig | undefined): ResolvedConfig {
     throw new ConfigError('缺少 Bot Token：请设置 botTokenRef 指向的环境变量，或设 dryRun: true 做本地验证')
   }
 
+  const publicOrigin = cfg.publicOrigin ?? ''
+  if (!/^https:\/\/[a-z0-9.-]+$/.test(publicOrigin)) {
+    throw new ConfigError('publicOrigin 必须是配置的 HTTPS 公网域名 origin')
+  }
+  const secretFile = cfg.secretFile ?? ''
+  if (!secretFile.startsWith('/')) throw new ConfigError('secretFile 必须是 root-only 凭据的绝对路径')
+  const botUsername = (cfg.botUsername ?? '').trim().replace(/^@/, '')
+  if (botUsername !== '' && !/^[A-Za-z][A-Za-z0-9_]{3,31}$/.test(botUsername)) {
+    throw new ConfigError(`botUsername "${botUsername}" 不是合法的 Telegram Bot 用户名`)
+  }
+  if (cfg.ttlSeconds !== undefined && Number(cfg.ttlSeconds) !== 300) throw new ConfigError('浏览器批准 TTL 固定为300秒')
   const dshHome = (process.env.DSH_HOME ?? '.').trim() || '.'
   return {
+    publicOrigin,
+    botUsername,
+    secretFile,
     botToken: token,
     adminChatId,
     ttlSeconds: positiveInt(cfg.ttlSeconds, 300, 'ttlSeconds'),

@@ -26,18 +26,32 @@ DSH 的 Web 登录是「每进程随机 token → 换取**30 天**签名 cookie�
 不接管 `/`，而是包装 `ctx.connection.authorizeIndex`。
 index.html 的提供、目录遍历防护、`<base>` 注入全部保持 DSH 原样。
 
+登录入口不再依赖 URL 里的 token，而是要求一个**长期独立 Secret Key**：
+
 ```
-GET /?token=...
- └─ authorizeIndex()
-      ├─ 已有会话                    → 交回 DSH，零打扰，不发通知
-      ├─ 无 token / token 无效        → 交回 DSH，保持原 401
-      ├─ 有效 token 且待批准          → 返回等待页（meta refresh 自动刷新）
-      ├─ 有效 token 且已批准          → 交回 DSH 完成 303 + Set-Cookie
-      └─ 有效 token 且被拒/过期/限流  → 返回对应结果页
+GET /                       → 未认证，返回登录表单（不落 DSH 的 401）
+POST /login  (secret)       → 校验 Secret Key
+                              ├─ 错误                → 401 密钥错误页，不发通知
+                              ├─ 已有待批准/已批准    → 303 复用同一请求（不轰炸通知）
+                              ├─ 触发限流            → 429
+                              └─ 正确               → 新建批准请求
+                                                        ├─ 下发 nonce cookie
+                                                        ├─ 发 Telegram 确认卡片
+                                                        └─ 303 → /login/status?request=...
+GET /login/status?request=… → 校验 nonce cookie 与请求绑定
+                              ├─ pending             → 200 等待页（meta refresh 自动刷新）
+                              ├─ denied / expired    → 403 / 410
+                              └─ approved            → 单次消费，交回 DSH 完成 303 + Set-Cookie
 ```
 
-**关键安全性质**：批准只是「准入」，不是「认证」。放行时仍然调用 DSH 原方法校验 token，
-所以攻击者即使骗你点了确认，只要没有正确 token，最终仍是 **401**（双保险）。
+**关键安全性质**：批准只是「准入」，不是「认证」。批准后仍由 DSH 原方法签发会话 cookie，
+且批准**单次消费**、绑定浏览器 nonce——重放等待页只会得到 401。
+
+### 旧 launch token 已停用
+
+早期版本（M1）用 URL 里的 `?token=...` 作为门禁信号。该模型已**移除**：
+带 `token` 查询参数的请求现在被明确拒绝（401），不再进入批准流程。
+规格文档见 [`docs/dsh-telegram-login-approval.md`](docs/dsh-telegram-login-approval.md)（M1 历史设计）。
 
 ## 安装
 
@@ -49,13 +63,28 @@ GET /?token=...
 > 建议**与其它 TG 插件使用不同的 Bot**。Telegram 的 `getUpdates` 一个 Bot 只能有一个消费者，
 > 共用 Bot 会导致两个插件互相抢更新。
 
-### 2. 放置插件
+### 2. 生成 Secret Key
+
+登录不再是「拿到 URL 就能进」，而是要输入一个独立密钥：
+
+```bash
+install -d -m 700 /etc/dsh
+install -m 600 /dev/null /etc/dsh/web-secret.key
+head -c 32 /dev/urandom | base64 | tr -d '\n' > /etc/dsh/web-secret.key
+```
+
+文件必须是 **root 所有、权限 600 的普通文件**（正好 43 字符的 base64）。
+插件启动时会强制校验，不满足直接抛错——不会静默放行。
+
+登录后在 Telegram 私聊你的 Bot 发送 `/key`，即可随时取回该密钥。
+
+### 3. 放置插件
 
 ```bash
 git clone https://github.com/JJDonald/dsh-telegram-login-approval.git
 ```
 
-### 3. 配置 overlay
+### 4. 配置 overlay
 
 复制 `cordis.example.yml`，把 `<PLUGIN_DIR>` 换成插件在本机的**绝对路径**：
 
@@ -65,11 +94,14 @@ git clone https://github.com/JJDonald/dsh-telegram-login-approval.git
       name: '/home/you/dsh-telegram-login-approval/src/index.ts'   # Windows: 'F:/path/...'
       config:
         botTokenRef: TELEGRAM_LOGIN_BOT_TOKEN
-        adminChatId: 123456789        # 改成你自己的数字 ID
+        adminChatId: 123456789                        # 改成你自己的数字 ID
+        publicOrigin: 'https://dsh.example.com'       # 你的公开 HTTPS origin
+        botUsername: 'example_bot'                    # 你的 Bot 用户名（不含 @）
+        secretFile: '/etc/dsh/web-secret.key'         # 上一步生成的文件
         dryRun: false
 ```
 
-### 4. 启动
+### 5. 启动
 
 ```bash
 export TELEGRAM_LOGIN_BOT_TOKEN='123456:ABC...'
@@ -83,20 +115,24 @@ node --import tsx/esm apps/cli/src/bin.ts \
 
 > `--patch` 属于 `dsh` 层级参数，必须放在 `--profile` **之后**、app 参数（`--no-open` 等）**之前**。
 
-### 5. 首次登录
+### 6. 首次登录
 
-打开启动时打印的 `http://127.0.0.1:8188/?token=...`。
-浏览器会显示「等待手机确认」，同时 Telegram 收到带 **✅ 确认登录 / ❌ 拒绝** 按钮的卡片。
+直接访问 `https://<你的 publicOrigin>/`，输入 Secret Key。
+浏览器显示「等待 Telegram 确认」，同时 Telegram 收到带 **✅ 确认登录 / ❌ 拒绝** 按钮的卡片。
+点确认后页面自动跳转进入。
 
 ## 配置项
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | `false` 时完全不包装（等价于未安装） |
+| `publicOrigin` | **必填** | 本部署唯一的公开 HTTPS origin，如 `https://dsh.example.com` |
+| `botUsername` | `''` | Bot 用户名（不含 `@`）；仅用于页面文案与 `/key@<bot>` 匹配 |
+| `secretFile` | **必填** | root-only Secret Key 文件的绝对路径 |
 | `botTokenRef` | — | Bot Token 的**环境变量名**（推荐） |
 | `botToken` | — | 直接写 token（不推荐，容易误提交） |
-| `adminChatId` | 必填 | 唯一被接受的 Telegram 数字用户 ID |
-| `ttlSeconds` | `300` | 批准请求有效期 |
+| `adminChatId` | **必填** | 唯一被接受的 Telegram 数字用户 ID |
+| `ttlSeconds` | `300` | 批准请求有效期（当前固定 300） |
 | `windowSeconds` | `600` | 限流窗口 |
 | `maxTriggersPerWindow` | `3` | 窗口内最多触发次数 |
 | `cooldownSeconds` | `600` | 超限后的冷却时长 |
@@ -105,7 +141,8 @@ node --import tsx/esm apps/cli/src/bin.ts \
 | `dataDir` | `$DSH_HOME/storages/telegram-login-approval` | offset 落盘目录 |
 
 **配置缺失会直接抛错**，而不是静默退化成「无门禁」——这是安全路径，
-不允许「忘配就等于不生效」。
+不允许「忘配就等于不生效」。`publicOrigin` 与 `botUsername` 都是配置项，
+源码里不写死任何具体域名或 Bot。
 
 ## 任务完成通知
 
@@ -133,28 +170,33 @@ npm test
 
 ```bash
 cd /path/to/deepseek-harness
-node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/gate.test.mts        # 9 个用例
+node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/gate.test.mts        # 18 个用例
 node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test.mts  # 12 个用例
 ```
 
-**21 个用例，全部不需要真实 Bot**（`dryRun` 下零网络请求）。
+**30 个用例，全部不需要真实 Bot**：用 fake ctx + 假 `fetch` 驱动完整的
+「Secret Key → 带外批准 → 单次凭证交换 → 不可重放」链路。
 
 覆盖的关键性质：
 
-- 门禁判定：无 token / 无效 token → 401；有效 token → 等待页
-- `prototype` 补丁确实生效（新 facade 也命中）
-- 同一 token 重复访问复用 pending（不轰炸通知）
-- 卸载后原型方法还原
-- 多轮任务只推一条通知；静置期重新开跑则取消通知
-- `dispose` 后不再触发通知
+- 未认证 `GET /` → 200 登录表单（不落入 DSH 的 401）；旧 `?token=` → 401
+- 错误 Secret Key → 401 且**不发**任何 Telegram 通知
+- 正确 Secret Key → 303 + nonce cookie；重复提交复用同一请求（不轰炸通知）
+- 非白名单 Telegram 用户无法批准
+- 批准 → 303 交换凭证并清除 nonce；**不可重放**（再次访问 401）
+- 拒绝 → 403 且不发凭证
+- 配置校验：缺 `adminChatId` / 非 HTTPS `publicOrigin` / 非法 `botUsername` 均抛错
+- `prototype` 补丁确实生效（新 facade 也命中）；卸载后还原
+- 多轮任务只推一条通知；静置期重新开跑则取消通知；`dispose` 后不再触发
 
 ## 安全说明
 
 - 批准请求**只存内存**，进程重启即全部失效（fail-closed）。
-- 批准**单次消费**，不可重放。
-- **日志不出现 token / cookie / Bot Token**；pending 只存 `sha256(token)`。
+- 批准**单次消费**，不可重放；批准绑定浏览器随机 nonce（`__Host-` cookie）。
+- **日志不出现 Secret Key / nonce / cookie / Bot Token**；pending 只存 `sha256(nonce)`。
 - 只接受 `adminChatId` 的**私聊**消息，其余静默忽略并记日志。
 - 插件异常一律 **fail-closed**（按未认证处理），不擅自放行。
+- 输入正文限制 4 KiB，错误密钥不触发任何通知。
 - 限流用**全局单键**而非 per-IP：插件运行在 DSH 进程内，拿不到可信客户端 IP
   （DSH 不采信 `X-Forwarded-*`）。真正的按 IP 限流应放在反代层
   （nginx `limit_req` / fail2ban）。
@@ -165,13 +207,14 @@ node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test
   `ctx.connection.authorizeIndex` / `requestRejection` 与 `ctx.webServer`，
   DSH 升级后建议重跑测试。
 - 依赖 `authorizeIndex` 无服务端副作用（只签名 cookie、不写状态）。
-  若上游改为写会话表，`isTokenValid` 的探测方式需要重新评估。
+  若上游改为写会话表，探测方式需要重新评估。
 - **会话撤销（`/revoke`）尚未实现**。当前撤销全部会话仍需「删凭据记录 + 重启 `dsh`」。
 - 批准请求不持久化 —— 这是刻意的 fail-closed 选择，不是缺陷。
+- 撤销当前浏览器会话仍需手动清除其 cookie；插件无法单方面吊销 DSH 已签发的会话。
 
 ## 实现要点（给想改代码的人）
 
-三个容易踩的坑，都已写进代码注释：
+四个容易踩的坑，都已写进代码注释：
 
 1. **必须改共享 prototype，不能改实例**。`ctx.connection` 是 Cordis 的服务 facade，
    每次属性访问都返回新对象，实例上的 `defineProperty` 会被静默丢弃。
@@ -179,6 +222,8 @@ node --import tsx/esm /path/to/dsh-telegram-login-approval/tests/task-watch.test
    写成 `effect(() => callback())` 会在安装那一刻就执行清理。
 3. **`authorizeIndex` 不能用返回值判态**。它成功时也返回 `false`（已写 303），
    失败时已经写过 401。判态要用 `requestRejection`（纯检查、不写响应）。
+4. **凭证交换必须拦截 DSH 的 `writeHead`**，确认它确实写了 303 + `Set-Cookie` 才放行；
+   否则说明 DSH 侧认证未完成，直接抛错而不是发一个空会话。
 
 ## 许可
 

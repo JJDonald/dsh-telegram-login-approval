@@ -13,7 +13,7 @@ export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired'
 export interface PendingApproval {
   /** 随机 id，用于 Telegram callback_data（不可预测）。 */
   id: string
-  /** sha256(launch token)；**绝不存明文 token**。 */
+  /** sha256(浏览器随机 nonce)；**绝不存明文 token**。 */
   tokenHash: string
   ip: string
   userAgent: string
@@ -33,7 +33,7 @@ const EXPIRED_RETENTION_MS = 3600_000
 /** 内存中最多保留的条目数，防止无界增长。 */
 const MAX_ENTRIES = 512
 
-/** token → sha256 十六进制。 */
+/** nonce → sha256 十六进制。 */
 export function hashToken(token: string): string {
   return createHash('sha256').update(token, 'utf8').digest('hex')
 }
@@ -53,7 +53,7 @@ export class ApprovalStore {
   /** 清理过期条目并回收内存。 */
   private sweep(now: number): void {
     for (const [id, item] of this.byId) {
-      if (item.status === 'pending' && item.expiresAt <= now) {
+      if ((item.status === 'pending' || item.status === 'approved') && item.expiresAt <= now) {
         item.status = 'expired'
       }
       const stale = item.status !== 'pending' && now - item.expiresAt > EXPIRED_RETENTION_MS
@@ -67,7 +67,7 @@ export class ApprovalStore {
   }
 
   /**
-   * 为同一 token 复用未决请求，避免刷新导致的通知轰炸。
+   * 为同一浏览器 nonce 复用未决请求，避免刷新导致的通知轰炸。
    * @returns 复用或新建的请求，以及是否为新建。
    */
   createOrReuse(tokenHash: string, ip: string, userAgent: string): { item: PendingApproval; created: boolean } {
@@ -100,7 +100,7 @@ export class ApprovalStore {
     return { item, created: true }
   }
 
-  /** 按 token 哈希查找（含已过期条目，便于给出准确提示）。 */
+  /** 按 nonce 哈希查找（含已过期条目，便于给出准确提示）。 */
   find(tokenHash: string): PendingApproval | undefined {
     const now = Date.now()
     this.sweep(now)

@@ -26,7 +26,7 @@ export interface TgUpdate {
     id: string
     from: { id: number }
     data?: string
-    message?: { message_id: number; chat: { id: number } }
+    message?: { message_id: number; chat: { id: number; type?: string } }
   }
 }
 
@@ -148,7 +148,7 @@ export class TelegramClient {
 /** offset 的持久化（不丢更新、不重复处理）。 */
 export class OffsetStore {
   private next: number
-  private readonly first: boolean
+  private first: boolean
 
   constructor(private readonly file: string) {
     let parsed: { nextOffset?: number } = {}
@@ -185,6 +185,7 @@ export class OffsetStore {
 
   /** 首次运行时直接快进到最新，不处理积压。 */
   fastForward(updates: readonly TgUpdate[]): void {
+    this.first = false
     for (const update of updates) this.next = Math.max(this.next, update.update_id + 1)
     try {
       mkdirSync(dirname(this.file), { recursive: true })

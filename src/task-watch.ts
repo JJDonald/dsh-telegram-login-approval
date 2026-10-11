@@ -147,6 +147,7 @@ export class TurnWatcher {
         })
       } else {
         this.cancelSettle(sessionId)
+        existing.lastText = ''
       }
       return
     }
@@ -162,13 +163,13 @@ export class TurnWatcher {
     if (type === 'assistant/message') {
       const stretch = this.stretches.get(sessionId)
       if (stretch === undefined) return
-      const text = extractText((data as { message?: unknown } | undefined)?.message)
-      // 只保留最新一条非空文本作为"最终回答"。
-      if (text.trim() !== '') {
-        stretch.lastText = text.length > this.deps.maxTextChars
-          ? `${text.slice(0, this.deps.maxTextChars)}\n…（已截断）`
-          : text
-      }
+      const eventData = data as { interrupted?: boolean; message?: { content?: Array<{ type?: string }> } } | undefined
+      const message = eventData?.message
+      const finalCandidate = eventData?.interrupted !== true && !message?.content?.some(block => block.type === 'tool-call')
+      const text = finalCandidate ? extractText(message) : ''
+      stretch.lastText = text.length > this.deps.maxTextChars
+        ? `${text.slice(0, this.deps.maxTextChars)}\n…（已截断）`
+        : text
       return
     }
   }
@@ -210,7 +211,7 @@ export class TurnWatcher {
       turns: stretch.turns,
       durationMs,
       reason: stretch.lastReason,
-      text: stretch.lastText,
+      text: stretch.lastReason === 'completed' ? stretch.lastText : '',
       detail: '',
       hadUserInput: true,
     }

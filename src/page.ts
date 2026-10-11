@@ -22,6 +22,11 @@ export function escapeHtml(value: string): string {
 /** 页面状态。 */
 export type GateState = 'waiting' | 'denied' | 'expired' | 'rate-limited' | 'approved-replay'
 
+// --- 以下为 M1 遗留渲染器 -----------------------------------------------
+// renderGatePage / renderPlainError 属于旧 launch-token 模型的等待页，
+// 在新模型中已无调用方（登录页见 ./login-page.ts）。保留是为了避免无谓的
+// 历史删除；新代码请勿使用，其文案引用的 `?token=` 入口已停用。
+
 interface PageOptions {
   state: GateState
   /** 自动刷新间隔（秒）；0 表示不刷新。 */
