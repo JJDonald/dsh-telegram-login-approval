@@ -6,7 +6,7 @@
  * 必须被验证。这里用一个最小 fake ctx 直接驱动插件的 `apply`。
  *
  * 运行：
- *   cd dsh && node --import tsx/esm ../plugin/dsh-telegram-login-approval/tests/gate.test.ts
+ *   cd dsh && node --import tsx/esm ../opendsh/tests/gate.test.mts
  */
 
 import { strict as assert } from 'node:assert'

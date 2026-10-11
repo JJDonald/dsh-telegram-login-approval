@@ -393,7 +393,7 @@ GET /  →  frontend-static fallback  →  serveStatic()
 ```bash
 node --import tsx/esm apps/cli/src/bin.ts \
   --profile web \
-  --patch F:/workspace/opendsh/plugin/<name>/cordis.yml \
+  --patch F:/workspace/opendsh/cordis.yml \
   --no-open --port <PORT>
 ```
 
@@ -417,7 +417,7 @@ node --import tsx/esm apps/cli/src/bin.ts \
 
 ### A6. M1 实现与验证结果
 
-M1（登录带外批准）已实现于 `plugin/dsh-telegram-login-approval/`，7 个模块：
+M1（登录带外批准）已实现于仓库根目录（`src/`），7 个模块：
 
 | 文件 | 职责 |
 |---|---|
@@ -432,7 +432,7 @@ M1（登录带外批准）已实现于 `plugin/dsh-telegram-login-approval/`，7
 **集成测试（fake ctx，9/9 通过）**
 
 ```
-cd dsh && node --import tsx/esm ../plugin/dsh-telegram-login-approval/tests/gate.test.mts
+cd dsh && node --import tsx/esm ../opendsh/tests/gate.test.mts
 
 ✅ 插件 apply 成功执行
 ✅ prototype 补丁生效（新 facade 也命中）
@@ -488,7 +488,7 @@ agent 变 `idle` 后等待 `800ms` 再复查，若期间又被异步排入则取
 **单元测试（12/12 通过）**
 
 ```
-cd dsh && node --import tsx/esm ../plugin/dsh-telegram-login-approval/tests/task-watch.test.mts
+cd dsh && node --import tsx/esm ../opendsh/tests/task-watch.test.mts
 
 ✅ 纯函数：classifyReason / reasonDetail / extractText / humanDuration / renderNotice
 ✅ 多轮任务只推一条通知（不是每轮一条）        ← 4 轮合并为 1 条

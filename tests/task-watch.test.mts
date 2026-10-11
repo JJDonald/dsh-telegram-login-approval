@@ -7,7 +7,7 @@
  *  3. 静置后确实 idle → 推一条，并带上轮次数/耗时/最终文本
  *  4. dispose 后不再触发任何通知
  *
- * 运行：cd dsh && node --import tsx/esm ../plugin/dsh-telegram-login-approval/tests/task-watch.test.mts
+ * 运行：cd dsh && node --import tsx/esm ../opendsh/tests/task-watch.test.mts
  */
 
 import { strict as assert } from 'node:assert'
