@@ -5,6 +5,11 @@
 1. **登录带外批准** —— 有人尝试登录你的 DSH，必须你在手机上点确认，才发放会话 cookie。
 2. **任务完成通知** —— 长任务跑完（或多轮任务结束）推一条消息到手机。
 
+另外默认恢复配置的公开 HTTPS origin 上 **DSH 原生 WebUI 设置页的 Host 持久配置**：
+直接在原生模型页编辑模型、提供商、API Key 和默认模型，不增加独立网页或 TG 模型编辑。
+`remoteSettings: false` 可关闭。注意这启用的是**原生 settings 整页**，不只模型；
+已有登录批准、会话及 Host/Origin 保护不变。详见 [远程原生设置](docs/remote-settings.md)。
+
 零 npm 依赖（只用 Node 内置能力），以 Cordis 插件形式挂载，**不改 DSH 源码**。
 
 ---
@@ -138,6 +143,7 @@ node --import tsx/esm apps/cli/src/bin.ts \
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | `false` 时完全不包装（等价于未安装） |
+| `remoteSettings` | `true` | 为本次运行的公开 HTTPS origin 启用原生 settings 整页 Host 持久配置；`false` 保持上游客户端不变 |
 | `publicOrigin` | **必填** | 本部署唯一的公开 HTTPS origin，如 `https://dsh.example.com` |
 | `botUsername` | `''` | Bot 用户名（不含 `@`）；仅用于页面文案与 `/key@<bot>` 匹配 |
 | `secretFile` | **必填** | root-only Secret Key 文件的绝对路径 |
@@ -159,6 +165,23 @@ node --import tsx/esm apps/cli/src/bin.ts \
 源码里不写死任何具体域名或 Bot。面板设置保存后优先于 overlay 默认值；
 期限设置立即用于新条目，旧会话/批准/已启动冷却保持原截止时间。
 绑定/公开地址只在下次人工启动加载，面板同时显示运行值与待生效值。
+
+## 原生 WebUI 远程设置
+
+默认开启，支持 DSH **0.2.0-rc.2** 的 `dsh-client-ui-settings` / `clientModules` 适配点。
+经正常登录后在原生模型页配置，仍调用原生 `settings/describe/update/mutate`、`credentials/set` 等接口；
+保存由 DSH 的 profile 配置编辑器和凭据 provider 完成。环境变量提供的只读 API Key 仍不可覆盖。
+插件不伪造 `isLoopback`、不改全局 `fetch`、不放宽后端认证或其他 origin。
+
+实现仅在内存中改原生 settings 模块的单一 host/memory 选择表达式，
+使用当前运行 `publicOrigin`（已保存启动值优先）；TG 修改地址仍只在下次启动生效。
+原生 registry 为转换后的源码生成独立模块/combo revision，source map 使用转换源码的 identity map；
+HMR 再发布时仍适配同一模块，卸载恢复原始方法和当前上游源码。**不修改 DSH 安装文件**。
+
+这是一项可选 UI 功能：缺 `clientModules` 不阻塞登录门禁；源码或接口不兼容时明确记录
+`remoteSettings 未启用`，保留上游行为，门禁仍正常。DSH 升级后应检查该诊断并重新验证适配。
+后续部署如果还有旧手工修改，可另行经批准恢复原版文件；本插件不自动修改它。
+关闭功能也不会移除安装文件中已有的手工条件。完整边界见 [功能说明](docs/remote-settings.md)。
 
 ## 任务完成通知
 

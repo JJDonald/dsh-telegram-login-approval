@@ -17,6 +17,10 @@
         # 总开关；false 时完全不包装，等价于未安装。
         enabled: true
 
+        # 为公开HTTPS origin开启原生settings整页Host持久配置（不只模型）。
+        # 依赖DSH0.2.0-rc.2适配点；false保持上游原样，不改后端权限。
+        remoteSettings: true
+
         # Bot Token 的环境变量名（推荐）。程序启动时从环境读取，配置里不出现明文。
         botTokenRef: TELEGRAM_LOGIN_BOT_TOKEN
 

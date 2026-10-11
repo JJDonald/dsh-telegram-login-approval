@@ -12,6 +12,8 @@ import { validateSetting } from './settings.ts'
 export interface RawConfig {
   /** 总开关；false 时插件完全不包装 authorizeIndex（等价于未安装）。 */
   enabled?: boolean
+  /** 为公开HTTPS origin启用原生settings整页Host持久配置（默认true）。 */
+  remoteSettings?: boolean
   /** 唯一公开 HTTPS origin。 */
   publicOrigin?: string
   /** Bot 用户名（不含 @）；仅用于页面提示文案与 `/key` 指令匹配，可选。 */
@@ -46,6 +48,7 @@ export interface RawConfig {
 
 /** 校验并补默认值后的运行时配置。 */
 export interface ResolvedConfig {
+  remoteSettings: boolean
   publicOrigin: string
   /** 规范化后的 Bot 用户名（无 @）；未配置时为空串，页面提示自动降级为通用文案。 */
   botUsername: string
@@ -102,6 +105,9 @@ function positiveInt(value: unknown, fallback: number, name: string): number {
 export function resolveConfig(raw: RawConfig | undefined): ResolvedConfig {
   const cfg: RawConfig = raw ?? {}
   const token = resolveBotToken(cfg)
+  if (cfg.remoteSettings !== undefined && typeof cfg.remoteSettings !== 'boolean') {
+    throw new ConfigError('remoteSettings 必须是布尔值')
+  }
 
   const adminChatId = cfg.adminChatId === undefined ? 0 : Number(cfg.adminChatId)
   if (!Number.isSafeInteger(adminChatId) || adminChatId <= 0) {
@@ -126,6 +132,7 @@ export function resolveConfig(raw: RawConfig | undefined): ResolvedConfig {
   const sessionDays = positiveInt(cfg.sessionDays, 30, 'sessionDays')
   const dshHome = (process.env.DSH_HOME ?? '.').trim() || '.'
   return {
+    remoteSettings: cfg.remoteSettings !== false,
     publicOrigin,
     botUsername,
     secretFile,

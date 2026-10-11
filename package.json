@@ -22,6 +22,7 @@
     "cordis.example.yml",
     "scripts",
     "docs/web-console.md",
+    "docs/remote-settings.md",
     "README.md",
     "LICENSE"
   ],

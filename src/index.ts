@@ -26,6 +26,7 @@ import { escapeHtml } from './page.ts'
 import { WebLogin, type LoginConnection } from './web-login.ts'
 import type { IncomingMessage, ServerResponse, Server } from 'node:http'
 import { installTaskNotify } from './task-notify.ts'
+import { installRemoteSettings } from './remote-settings.ts'
 
 export const name = 'telegram-login-approval'
 
@@ -366,6 +367,9 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
       (error: unknown) => { log.warn(`Bot 自检异常: ${String(error)}`) },
     )
   }
+
+  if (config.remoteSettings) installRemoteSettings(ctx, runtime.publicOrigin, log)
+  else log.info('remoteSettings=false：保持原生settings客户端不变')
 
   process.stdout.write('DSH_TELEGRAM_GATE_READY\n')
   log.info(`门禁已就绪（adminChatId=${String(config.adminChatId)}, 状态条目=${String(store.size())}）`)
