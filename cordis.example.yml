@@ -1,0 +1,39 @@
+# 把本插件挂到 DSH 的 web profile。
+#
+# 用法：
+#   1. 复制本文件为 cordis.yml（或任意名字）
+#   2. 把 <PLUGIN_DIR> 替换为本插件在本机的绝对路径
+#      例：Linux/macOS  /home/you/dsh-telegram-login-approval
+#          Windows      F:/path/to/dsh-telegram-login-approval
+#   3. 设置 Bot Token 环境变量（见 README「安装」）
+#
+# 注意：Cordis 的 patch overlay 要求 name 是**绝对路径**，
+# 且 Windows 上必须写成 `F:/...` 而不是 `/f/...`（后者会被解析成 `F:/f/...`）。
+
+- insert:
+    - id: telegram-login-approval
+      name: '<PLUGIN_DIR>/src/index.ts'
+      config:
+        # 总开关；false 时完全不包装，等价于未安装。
+        enabled: true
+
+        # Bot Token 的环境变量名（推荐）。程序启动时从环境读取，配置里不出现明文。
+        botTokenRef: TELEGRAM_LOGIN_BOT_TOKEN
+
+        # 唯一被接受的 Telegram 数字用户 ID（用 @userinfobot 查询）。
+        # 下面的值是占位示例，务必改成你自己的。
+        adminChatId: 123456789
+
+        # 登录批准请求的有效期（秒）。
+        ttlSeconds: 300
+
+        # 触发限流：窗口秒数 / 窗口内最多触发次数 / 超限后的冷却秒数。
+        windowSeconds: 600
+        maxTriggersPerWindow: 3
+        cooldownSeconds: 600
+
+        # 被拒绝时是否回发提示。
+        notifyOnDeny: true
+
+        # 演习模式：true 时不发起任何 Telegram 网络请求，仅本地验证门禁行为。
+        dryRun: false
