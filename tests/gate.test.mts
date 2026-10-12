@@ -349,6 +349,7 @@ await check('错误 Secret Key → 401 且不发送任何 Telegram 通知', asyn
 let cookie = ''
 let requestId = ''
 let sessionCookie = ''
+let pendingCookie = ''
 await check('正确 Secret Key → 303 到等待页并下发 nonce cookie', async () => {
   const before = tg.sendMessage
   const out = await postLogin()
@@ -480,6 +481,7 @@ await check('【安全】管理卡片私聊/消息绑定、设置回复绑定、
   const file = `${process.env.DSH_HOME}/storages/telegram-login-approval/web-settings.json`
   assert.equal(JSON.parse(readFileSync(file, 'utf8')).approvalSeconds, 60)
   const next = await postLogin()
+  pendingCookie = cookieOf(next)
   assert.ok(String(next.headers['set-cookie']).includes('Max-Age=60'))
   queue.push(command(ADMIN, 'private')); await sleep(40)
   payload = tg.payloads.at(-1)!
@@ -494,12 +496,17 @@ await check('【安全】管理卡片私聊/消息绑定、设置回复绑定、
   assert.ok(!logs.join('\n').includes(SECRET) && !logs.join('\n').includes(sessionCookie))
 })
 
-await check('【安全】错误密钥10次/60秒后真正全局冷却600秒，不是通知限流', async () => {
+await check('【安全】错误密钥全局冷却600秒只限制错误输入，正确密钥仍可复用待审批', async () => {
   // 前面的首条错误仍在同一窗口，补9次达到10次。
   for (let i = 0; i < 9; i++) assert.equal((await postLogin(undefined, 'bad')).status, 401)
-  const out = await postLogin()
+  const out = await postLogin(undefined, 'bad')
   assert.equal(out.status, 429)
   assert.ok(Number(out.headers['retry-after']) > 590)
+  // 复用此前待审批nonce，避免把独立通知配额耗尽误判为错误桶限制。
+  const correct = await postLogin(pendingCookie)
+  assert.equal(correct.status, 303)
+  assert.ok(String(correct.headers.location).startsWith('/login/status?request='))
+  assert.equal(correct.headers['set-cookie'], undefined, '复用审批不能直接签发会话')
   const limit = new FailureLimiter(600)
   for (let i = 0; i < 10; i++) limit.record(100000)
   assert.equal(limit.check(100000), 600)

@@ -44,16 +44,16 @@ export class TriggerLimiter {
     return { allowed: true, retryAfterSeconds: 0 }
   }
 
-  /** 记一次触发；超限则进入冷却。 */
+  /** 记一次获准触发；达到上限即进入冷却，不额外放行第 N+1 次。 */
   record(key: string, now = Date.now()): void {
     const windowMs = this.windowSeconds * 1000
-    const bucket = this.buckets.get(key)
+    let bucket = this.buckets.get(key)
     if (bucket === undefined || now - bucket.windowStart > windowMs) {
-      this.buckets.set(key, { count: 1, windowStart: now, blockedUntil: 0 })
-      return
+      bucket = { count: 0, windowStart: now, blockedUntil: 0 }
+      this.buckets.set(key, bucket)
     }
     bucket.count += 1
-    if (bucket.count > this.maxPerWindow) {
+    if (bucket.count >= this.maxPerWindow) {
       bucket.blockedUntil = now + this.cooldownSeconds * 1000
       // 冷却开始后重置窗口，冷却结束时重新计数。
       bucket.count = 0
@@ -67,7 +67,7 @@ export class TriggerLimiter {
   }
 }
 
-/** 错误密钥冷却：全局10次错误/60秒，正确输入不计数。旧冷却保留原截止时间。 */
+/** 错误密钥冷却：全局10次错误/60秒；调用方仅对错误输入检查/计数，正确输入不受限。旧冷却保留原截止时间。 */
 export class FailureLimiter {
   private startedAt = 0
   private failures = 0

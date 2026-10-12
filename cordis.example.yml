@@ -37,9 +37,10 @@
         botUsername: 'example_bot'
 
         # 持久 Secret Key 文件的绝对路径（必填）。必须存在且为 root-only 普通文件
-        # （owner=root，权限 600）；插件启动时会强制校验，不满足直接抛错。
+        # （owner=root，权限 600）；32字节随机数据编码为无填充base64url（43字符），与重置密钥一致。
+        # 插件启动时会强制校验，不满足直接抛错。
         # 生成：install -m 600 /dev/null /etc/dsh/web-secret.key
-        #       head -c 32 /dev/urandom | base64 | tr -d '\n' > /etc/dsh/web-secret.key
+        #       node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))" > /etc/dsh/web-secret.key
         secretFile: '/etc/dsh/web-secret.key'
 
         # 新登录批准有效期：30–3600整数秒（nonce Cookie同步使用）。
@@ -49,7 +50,7 @@
         sessionDays: 30
 
         # 错误密钥全局10次/60秒后冷却；60–86400整数秒。
-        # 与下面的Telegram确认通知触发限流不同。
+        # 仅限制错误密钥，正确密钥仍可请求审批；与下面的Telegram确认通知触发限流不同。
         failureCooldownSeconds: 600
 
         # 使用 scripts/serve.ts 时必须与serve配置的dataDir一致。

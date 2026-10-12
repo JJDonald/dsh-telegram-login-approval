@@ -38,9 +38,9 @@ index.html 的提供、目录遍历防护、`<base>` 注入及原 Host/Origin fe
 ```
 GET /                       → 未认证，返回登录表单（不落 DSH 的 401）
 POST /login  (secret)       → 校验 Secret Key
-                              ├─ 错误                → 401 密钥错误页，不发通知
+                              ├─ 错误                → 401；错误桶冷却中为 429，不发通知
                               ├─ 已有待批准/已批准    → 303 复用同一请求（不轰炸通知）
-                              ├─ 触发限流            → 429
+                              ├─ 正确但通知配额耗尽  → 429
                               └─ 正确               → 新建批准请求
                                                         ├─ 下发 nonce cookie
                                                         ├─ 发 Telegram 确认卡片
@@ -79,10 +79,10 @@ GET /login/status?request=… → 校验 nonce cookie 与请求绑定
 ```bash
 install -d -m 700 /etc/dsh
 install -m 600 /dev/null /etc/dsh/web-secret.key
-head -c 32 /dev/urandom | base64 | tr -d '\n' > /etc/dsh/web-secret.key
+node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))" > /etc/dsh/web-secret.key
 ```
 
-文件必须是 **root 所有、权限 600 的普通文件**（正好 43 字符的 base64）。
+文件必须是 **root 所有、权限 600 的普通文件**（32 字节随机数据编码为无填充 base64url，正好 43 字符；与管理台重置密钥一致）。
 插件启动时会强制校验，不满足直接抛错——不会静默放行。
 
 在管理员 Telegram 私聊发送 `/key` 可取回密钥；发送 `/web` 或 `/start` 打开 **🌐 Web 管理台**。
@@ -152,7 +152,7 @@ node --import tsx/esm apps/cli/src/bin.ts \
 | `adminChatId` | **必填** | 唯一被接受的 Telegram 数字用户 ID |
 | `ttlSeconds` | `300` | 新批准有效期，30–3600 整数秒；nonce Cookie 同步使用该期限 |
 | `sessionDays` | `30` | 新Web会话有效期，整数天；不得超过当前DSH原生 `cookieMaxAgeDays` |
-| `failureCooldownSeconds` | `600` | 全局10次错误密钥/60秒后冷却，60–86400整数秒 |
+| `failureCooldownSeconds` | `600` | 全局10次错误密钥/60秒后仅限制错误输入，60–86400整数秒；正确密钥不受此冷却影响 |
 | `windowSeconds` | `600` | Telegram确认通知触发限流窗口（与错误密钥冷却独立） |
 | `maxTriggersPerWindow` | `3` | 窗口内最多触发次数 |
 | `cooldownSeconds` | `600` | 通知触发超限后的冷却时长（不控制错误密钥冷却） |
@@ -239,7 +239,7 @@ node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/t
 - 若旧版本已把 Bot Token 写入日志，升级不会消除旧记录或撤销 Token；需在 BotFather 更换 Token，并更新部署环境变量。
 - 只接受 `adminChatId` 的**私聊**消息，其余静默忽略并记日志。
 - 插件异常一律 **fail-closed**（按未认证处理），不擅自放行。
-- 输入正文限制 4 KiB，错误密钥不触发任何通知。
+- 输入正文限制 4 KiB，完成正文读取后校验密钥；错误密钥不触发任何通知，冷却中返回429及 Retry-After且不延长截止。正确密钥不检查或计入错误桶，仍受Telegram通知配额限制并必须获批。
 - 限流用**全局单键**而非 per-IP：插件运行在 DSH 进程内，拿不到可信客户端 IP
   （DSH 不采信 `X-Forwarded-*`）。真正的按 IP 限流应放在反代层
   （nginx `limit_req` / fail2ban）。

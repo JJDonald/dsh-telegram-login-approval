@@ -123,12 +123,6 @@ export class WebLogin {
     if (req.method !== 'POST') { res.writeHead(405, { allow: 'POST' }); res.end(); return }
     if (!this.trusted(req, true)) { this.reject(res, 403); return }
     if (new URL(req.url!, this.options.origin).search !== '') { this.reject(res, 400); return }
-    const now = Date.now()
-    const retry = this.options.failures.check(now)
-    if (retry > 0) {
-      res.setHeader('retry-after', String(retry))
-      this.html(req, res, 'rate-limited', 429, `错误密钥全局冷却，约 ${retry} 秒后重试。`); return
-    }
     if (readHeader(req.headers, 'content-type').split(';')[0] !== 'application/x-www-form-urlencoded') {
       this.reject(res, 415); return
     }
@@ -138,9 +132,16 @@ export class WebLogin {
     if (body === undefined) {
       res.setHeader('connection', 'close'); this.reject(res, 413); req.resume(); return
     }
+    // 先验证密钥；错误输入以正文完成时刻检查/计数，正确输入不受错误冷却影响。
+    const now = Date.now()
     const secrets = new URLSearchParams(body).getAll('secret')
     const supplied = Buffer.from(secrets.length === 1 ? secrets[0]! : '', 'utf8')
     if (supplied.length !== this.secret.length || !timingSafeEqual(supplied, this.secret)) {
+      const retry = this.options.failures.check(now)
+      if (retry > 0) {
+        res.setHeader('retry-after', String(retry))
+        this.html(req, res, 'rate-limited', 429, `错误密钥全局冷却，约 ${retry} 秒后重试。`); return
+      }
       this.options.failures.record(now)
       this.html(req, res, 'invalid', 401); return
     }

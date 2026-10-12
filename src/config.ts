@@ -30,7 +30,7 @@ export interface RawConfig {
   ttlSeconds?: number
   /** 新Web会话有效期（整数天，不得超过DSH原生Cookie寿命）。 */
   sessionDays?: number
-  /** 错误密钥10次/60秒后的全局冷却；与通知限流独立。 */
+  /** 错误密钥10次/60秒后的全局冷却；正确密钥不受影响，与通知限流独立。 */
   failureCooldownSeconds?: number
   /** 限流窗口（秒）。 */
   windowSeconds?: number
