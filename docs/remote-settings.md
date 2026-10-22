@@ -1,8 +1,16 @@
 # 原生 WebUI 远程持久设置
 
+## 版本选择
+
+- **DSH 0.2.1-rc.2**：原生客户端已经直接调用 `remote.settings.describe/mutate`，原生支持远程持久配置；建议 `remoteSettings: false`，不重打旧补丁。关闭该开关不会关闭新版原生设置能力。
+- **DSH 0.2.0-rc.2**：保留现有旧适配；`remoteSettings` 默认 `true`，按精确源码条件为配置的公开 origin 启用 Host 表单。
+- 开关仍为 `true` 时，若已注册的 settings 源码不匹配旧适配点，直接保留原始 registry 方法、模块字节和 revision，不安装旧补丁。模块尚未注册的延迟加载路径仍做源码检查；没有实际转换时 rebuilt 委托上游，新源码不匹配时也不再使用旧重建算法。
+
+下面的 origin 选择、内存转换与 HMR 说明针对 **0.2.0-rc.2 旧适配**；不是对新版原生页面增加 origin 限制。
+
 ## 使用与范围
 
-`remoteSettings` 默认 `true`，也可以在插件 overlay 中显式设置：
+旧版可在插件 overlay 中显式设置：
 
 ```yaml
 remoteSettings: true
@@ -17,10 +25,10 @@ API Key 通过原生 `credentials/set` 保存；原生 describe 不返回密钥�
 若 profile 缺少 settings/configEditor/凭据 provider，或配置被命令行 overlay 覆盖，原生页面仍可能报告不可写；插件不会绕过它们。
 
 `remoteSettings: false` 不安装任何客户端适配，保持实际安装的上游源码和行为。
-这不是撤销登录会话或关闭后端写 API：后端已有写接口始终由原生认证及插件会话层保护；功能开关只决定原生客户端是否选择 Host 表单。
+这不是撤销登录会话或关闭后端写 API：原生 settings 写接口仍由原生认证及插件会话层保护；功能开关只控制旧适配，新版仍保留原生页面行为。
 改变开关后重新加载页面获取相应模块版本，已运行页面不可能从服务端撤回已执行的 JavaScript。
 
-## Origin 与安全边界
+## 旧适配的 Origin 与安全边界
 
 远程启用条件为浏览器 `location.origin === 当前runtime.publicOrigin`，精确匹配协议、域名和端口。
 值来自本次启动的设置（已保存的 `web-settings.json` 优先于 overlay 初值），只把公开 origin 作为源码中的字符串字面量，不注入任何密钥、Cookie、nonce 或内存 launch token。
@@ -44,14 +52,14 @@ TG 保存新的公开地址不会修改正在运行的适配；下次人工启�
 如现有安装含旧的单-origin 手工 OR 条件，适配会**替换**那处条件为本次运行 origin，而非在其旁边追加第二个允许域名。
 本轮开发不修改/删除该手工文件；后续部署可按批准流程恢复原版。关闭或卸载插件只恢复实际上游源码，**不会自动消除磁盘上的旧手工条件**。
 
-## 缓存、资源和 HMR
+## 旧适配的缓存、资源和 HMR
 
 - 转换后的字节、功能版本标识与当前 origin 生成新的12位模块 revision；registry 正常从模块 revision 派生 combo 与启动图 revision。不会在原 immutable URL 下偷偷换字节。
 - 单包和多包 combo、graph preload 及 package-local chunk URL 都继续由原生 registry 管理。未修改的 chunk 字节与原生资源路由不被劫持，只随所属模块 revision 正常换URL。
 - 原生资源保持 `public, max-age=31536000, immutable`；当前接口不设置 ETag，插件也不伪造 ETag。HEAD 仍不生成正文。
 - 转换过的主 bundle 不使用旧 TypeScript source map，改由原生组合器生成**包含转换源码的 identity map**；其他包和 chunk 的原生 map 不变。调试可定位生成的 JavaScript，但此模块不再映射回原始 TypeScript。
 - `compose()` 每次都在原生组合资源之前处理当前 settings row，所以初始化扫描、后续加载/重挂载均不依赖浏览器脚本先后或“before注入能找到对象”的假设。
-- `rebuilt()` 仅对 settings 包按当前原生算法读取新的 baseline/源码，适配后发布实际 revision。HMR 的 rebuilt 和 graph 通知因此不会重新装回未适配源码；其他包沿用原方法。
+- `rebuilt()` 仅对已实际转换的旧 settings 包按支持版本的原生算法读取新的 baseline/源码，适配后发布实际 revision；没有实际转换的模块沿用原方法。若 HMR 后的新源码不匹配，恢复原始 row 并委托原生重建，不把旧算法套到新版原生模块上。
 - 上游保留一代旧 batch 给竞态请求；旧 single-module/chunk revision 可能返回404。旧 URL 不会变成新版字节。
 - 卸载恢复该 registry 的原始方法描述符和当前原生 settings row（包括最后一次HMR后的源码），重新组合并通知 graph。既有客户端缓存不需要手工清除：重加载使用恢复后的 revision。
 
@@ -63,13 +71,14 @@ TG 保存新的公开地址不会修改正在运行的适配；下次人工启�
 启动日志有 `remoteSettings` 前缀：
 
 - 等待/注册可选服务时说明登录门禁不等待它。
-- 成功时明确「原生 settings host 持久配置已适配」及其公开 origin。
+- 旧适配成功时明确「原生 settings host 持久配置已适配」及其公开 origin。
+- 已注册的源码不匹配时说明「保留原生 settings」「不安装旧 registry 补丁」；在 0.2.1-rc.2 上这是预期行为，不代表原生远程设置不可用。
 - 包尚未注册、源码不匹配、registry接口不兼容时记录 `remoteSettings 未启用` 及原因，保留上游UI行为，**不关闭登录门禁**。
 
 DSH升级后若适配点改变，本功能不猜测替换新源码。HMR出现未知新源码也保留它并警告；原生UI是否支持远程配置此时由上游决定。
 应检查日志并重新验证，不能把登录 gate READY 当成此可选功能已经就绪。
 
-## 本轮最小验证边界
+## 历史 0.2.0-rc.2 验证记录
 
 使用仓库内临时材料和本机临时端口，无真实Telegram消息、用户模型、真实API Key或付费调用：
 
@@ -79,4 +88,6 @@ DSH升级后若适配点改变，本功能不猜测替换新源码。HMR出现�
 - 原生Cordis/WebServer/Connection/Gateway/SettingsController/SettingsForms临时装配：表单通过真实HTTP settings接口编辑测试模型、提供商和默认模型，configEditor边界使用临时profile写入替身；原生LocalCredentialProvider将假测试Key持久化并脱敏describe。此检查不声称测试了完整生产profile热重载或浏览器DOM。
 - 未认证/仅旧Cookie401、不同Origin403；功能关闭、已保存运行origin、待生效origin不立即切换、不兼容源码和卸载路径验证。已有gate集成检查21/21通过。
 
-确切限制：适配绑定上述版本和接口；不安装缺失provider，不绕过只读/overlay覆盖，不保证新增上游模块布局自动兼容；仅恢复原生页面已有能力，不提供新的模型/凭据功能。
+以上是旧版历史验证，不代表本轮对新版重新做过真实 HTTP 写入、模型调用或浏览器端到端检查。
+
+确切限制：旧适配绑定上述版本和接口；不安装缺失provider，不绕过只读/overlay覆盖，不保证新增上游模块布局自动兼容；仅恢复原生页面已有能力，不提供新的模型/凭据功能。

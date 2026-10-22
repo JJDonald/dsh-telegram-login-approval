@@ -50,6 +50,11 @@ export function adaptSettings(registry: Registry, origin: string, log: MiniLogge
     typeof registry.compose !== 'function' || typeof registry.rebuilt !== 'function' ||
     typeof registry.captureArtifactBaseline !== 'function' || typeof registry.notifyGraphChanged !== 'function' ||
     typeof registry.readSourceMap !== 'function') throw new Error('unsupported clientModules registry')
+  const current = registry.table.get(SETTINGS_ID)
+  if (current && !settingsSource(current.bundle, origin)) {
+    log.info('remoteSettings: 保留原生 settings；客户端不符合 0.2.0-rc.2 适配点，不安装旧 registry 补丁')
+    return () => {}
+  }
   const compose = registry.compose
   const rebuilt = registry.rebuilt
   const descriptors = new Map(['compose', 'rebuilt'].map(key => [key, Object.getOwnPropertyDescriptor(registry, key)]))
@@ -95,7 +100,7 @@ export function adaptSettings(registry: Registry, origin: string, log: MiniLogge
     finally { this.readSourceMap = readMap }
   } })
   Object.defineProperty(registry, 'rebuilt', { configurable: true, writable: true, value: function (this: Registry, id: string) {
-    if (id !== SETTINGS_ID) return rebuilt.call(this, id)
+    if (id !== SETTINGS_ID || !adapted) return rebuilt.call(this, id)
     const row = this.table.get(id)
     if (!row) return undefined
     const baseline = this.captureArtifactBaseline(row.meta.clientPath)
@@ -105,6 +110,11 @@ export function adaptSettings(registry: Registry, origin: string, log: MiniLogge
     // The supported native rebuilt algorithm, scoped to this one row. Publishing
     // the adapted rev is essential: native notifications otherwise announce old bytes.
     const bundle = readFileSync(row.meta.clientPath)
+    if (!settingsSource(bundle, origin)) {
+      restoreRow()
+      log.warn('remoteSettings: HMR 后源码不匹配旧适配点，保留原生重建')
+      return rebuilt.call(this, id)
+    }
     row.baseline = baseline
     row.entry = { ...nativeEntry, rev: nativeRev, url: reference(nativeRev) }
     row.bundle = bundle

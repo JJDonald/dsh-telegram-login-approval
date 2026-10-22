@@ -144,6 +144,15 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
   }
   const rejectionDesc = Object.getOwnPropertyDescriptor(proto, 'requestRejection')
   if (!rejectionDesc || typeof rejectionDesc.value !== 'function') throw new ConfigError('无法定位requestRejection prototype')
+  const admitDesc = Object.getOwnPropertyDescriptor(proto, 'admit')
+  if (!admitDesc || typeof admitDesc.value !== 'function') throw new ConfigError('无法定位connection.admit prototype，拒绝启用不完整门禁')
+  const originalAdmit = admitDesc.value as (req: { headers: unknown }) => { peer: unknown } | { rejection: number }
+  // rc.2 的 admit 调用 requestRejection；alpha.4 则反向调用，两处都必须把守。
+  Object.defineProperty(proto, 'admit', { ...admitDesc, value: function (this: unknown, req: { headers: unknown }) {
+    const result = originalAdmit.call(this, req)
+    if ('rejection' in result || sessions.find(req)) return result
+    return { rejection: 401 }
+  } })
   const originalRejection = rejectionDesc.value as (req: { headers: unknown }) => number | undefined
   Object.defineProperty(proto, 'requestRejection', { ...rejectionDesc, value: function (this: unknown, req: { headers: unknown }) {
     const result = originalRejection.call(this, req)
@@ -162,6 +171,7 @@ export function apply(ctx: unknown, rawConfig?: RawConfig): void {
   // 卸载时还原共享 prototype（ctx.effect 在 fiber dispose 时调用）。
   ctxEffect(ctx, () => {
     disposeUpgrades()
+    Object.defineProperty(proto, 'admit', admitDesc)
     Object.defineProperty(proto, 'requestRejection', rejectionDesc)
     Object.defineProperty(proto, 'authorizeIndex', protoDesc)
     process.stdout.write('DSH_TELEGRAM_GATE_UNLOADED\n')

@@ -1,3 +1,4 @@
+import { isIP } from 'node:net'
 import { readJson, savePrivate } from './persistence.ts'
 
 export interface WebSettings {
@@ -12,7 +13,13 @@ export type Setting = keyof WebSettings
 
 export function validateSetting(key: Setting, value: unknown, maxSessionDays: number): string | number {
   if (key === 'host') {
-    if (value !== '127.0.0.1' && value !== '0.0.0.0') throw new Error('绑定地址仅支持 127.0.0.1 或 0.0.0.0（DSH 实际支持范围）')
+    if (typeof value !== 'string' || isIP(value) === 0 || value.includes('%')) {
+      throw new Error('绑定地址须为具体 IPv4/IPv6 地址，推荐 127.0.0.1；不支持域名、方括号或 %zone')
+    }
+    const address = isIP(value) === 6 ? new URL(`http://[${value}]/`).hostname : value
+    if (address === '0.0.0.0' || address === '[::]' || address === '[::ffff:0:0]') {
+      throw new Error('DSH 不支持通配绑定地址（0.0.0.0、:: 及其 IPv4-mapped 形式）；请改用 127.0.0.1 或本机具体接口地址')
+    }
     return value
   }
   if (key === 'publicOrigin') {

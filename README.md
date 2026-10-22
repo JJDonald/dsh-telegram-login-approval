@@ -5,10 +5,11 @@
 1. **登录带外批准** —— 有人尝试登录你的 DSH，必须你在手机上点确认，才发放会话 cookie。
 2. **任务完成通知** —— 长任务跑完（或多轮任务结束）推一条消息到手机。
 
-另外默认恢复配置的公开 HTTPS origin 上 **DSH 原生 WebUI 设置页的 Host 持久配置**：
-直接在原生模型页编辑模型、提供商、API Key 和默认模型，不增加独立网页或 TG 模型编辑。
-`remoteSettings: false` 可关闭。注意这启用的是**原生 settings 整页**，不只模型；
-已有登录批准、会话及 Host/Origin 保护不变。详见 [远程原生设置](docs/remote-settings.md)。
+**DSH 0.2.1-rc.2 已原生支持 WebUI 远程持久设置**，建议设置 `remoteSettings: false`，
+保留上游实现；关闭的是旧适配，不会关闭新版原生设置能力。
+旧 DSH 0.2.0-rc.2 仍可用默认开启的适配，为配置的公开 HTTPS origin 恢复 settings 整页 Host 持久配置。
+两种方式都在原生模型页编辑模型、提供商、API Key 和默认模型，不增加独立网页或 TG 模型编辑，
+不改变登录批准、会话及 Host/Origin 保护。详见 [远程原生设置](docs/remote-settings.md)。
 
 零 npm 依赖（只用 Node 内置能力），以 Cordis 插件形式挂载，**不改 DSH 源码**。
 
@@ -29,9 +30,14 @@ DSH 的 Web 登录是「每进程随机 token → 换取**30 天**签名 cookie�
 
 ## 工作原理
 
-不接管 `/` 的静态提供，而是包装共享 `ctx.connection.authorizeIndex` 和 `requestRejection`，
+不接管 `/` 的静态提供，而是包装共享 `ctx.connection.authorizeIndex`、`admit` 和 `requestRejection`，
 在 DSH 原生签名 Cookie 之外叠加独立持久化会话，并在 WebServer upgrade 分发前检查。
 index.html 的提供、目录遍历防护、`<base>` 注入及原 Host/Origin fence 全部保持 DSH 原样。
+
+**升级须保留本地 `src/index.ts` 的 admit 双入口补丁**：0.2.0-rc.2 是 `admit → requestRejection`，
+0.2.1-rc.2 是 `requestRejection → admit`，新版 HTTP RPC 直接走 admit。
+只保留旧 requestRejection 包装会让原生有效 Cookie 绕过额外会话层；不要用未含此补丁的旧 Git HEAD 覆盖工作树。
+本插件不是全局 HTTP 路由中间件：任意第三方 `webServer.register()` 路由若不调用 Connection，不会自动受保护。
 
 登录入口不再依赖 URL 里的 token，而是要求一个**长期独立 Secret Key**：
 
@@ -143,7 +149,7 @@ node --import tsx/esm apps/cli/src/bin.ts \
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enabled` | `true` | `false` 时完全不包装（等价于未安装） |
-| `remoteSettings` | `true` | 为本次运行的公开 HTTPS origin 启用原生 settings 整页 Host 持久配置；`false` 保持上游客户端不变 |
+| `remoteSettings` | `true` | 仅适配旧 0.2.0-rc.2 的 settings 客户端；新版 0.2.1-rc.2 建议设 `false`，保留原生远程设置 |
 | `publicOrigin` | **必填** | 本部署唯一的公开 HTTPS origin，如 `https://dsh.example.com` |
 | `botUsername` | `''` | Bot 用户名（不含 `@`）；仅用于页面文案与 `/key@<bot>` 匹配 |
 | `secretFile` | **必填** | root-only Secret Key 文件的绝对路径 |
@@ -168,7 +174,11 @@ node --import tsx/esm apps/cli/src/bin.ts \
 
 ## 原生 WebUI 远程设置
 
-默认开启，支持 DSH **0.2.0-rc.2** 的 `dsh-client-ui-settings` / `clientModules` 适配点。
+DSH **0.2.1-rc.2** 原生客户端已通过 `remote.settings.describe/mutate` 使用 Host 设置，不再依赖 loopback 选择表达式。
+该版本建议 `remoteSettings: false`；即使保持 `true`，已注册的新客户端源码不匹配时也不会安装旧 registry 补丁。
+没有实际适配的模块，其 rebuilt 仍委托原生方法；不猜测替换新版源码，不重打旧补丁。
+
+默认开启的旧适配继续支持 DSH **0.2.0-rc.2** 的 `dsh-client-ui-settings` / `clientModules` 适配点。
 经正常登录后在原生模型页配置，仍调用原生 `settings/describe/update/mutate`、`credentials/set` 等接口；
 保存由 DSH 的 profile 配置编辑器和凭据 provider 完成。环境变量提供的只读 API Key 仍不可覆盖。
 插件不伪造 `isLoopback`、不改全局 `fetch`、不放宽后端认证或其他 origin。
@@ -209,11 +219,12 @@ npm test
 
 ```bash
 cd /path/to/deepseek-harness
-node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/gate.test.mts  # 21 个用例
+node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/gate.test.mts  # 新版调用方向，24 个用例
+TLA_TEST_CONNECTION_MODE=legacy node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/gate.test.mts  # 同一套用例，旧版调用方向
 node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/task-watch.test.mts  # 12 个用例
 ```
 
-**33 个用例，全部不需要真实 Bot**：用 fake ctx + 假 HTTPS 请求驱动完整的
+全部用例不需要真实 Bot：用 fake ctx + 假 HTTPS 请求驱动完整的
 「Secret Key → 带外批准 → 单次凭证交换 → 不可重放」链路。
 
 覆盖的关键性质：
@@ -225,7 +236,8 @@ node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/t
 - 批准 → 303 交换凭证并清除 nonce；**不可重放**（再次访问 401）
 - 拒绝 → 403 且不发凭证
 - 配置校验：缺 `adminChatId` / 非 HTTPS `publicOrigin` / 非法 `botUsername` 均抛错
-- `prototype` 补丁确实生效（新 facade 也命中）；卸载后还原
+- `prototype` 双入口补丁确实生效；新版/旧版相反调用方向均可验证，卸载后还原 admit 与 requestRejection
+- 具体 IPv4/IPv6 绑定校验、拒绝通配值、保存失败不更改设置、serve.ts `--check` 入口拒绝旧通配设置
 - 新会话哈希持久化、多浏览器独立、旧 Cookie 拒绝、撤销后不复活
 - 管理台私聊/消息绑定、设置回复绑定、踢出二次确认、错误密钥全局冷却
 - 多轮任务只推一条通知；静置期重新开跑则取消通知；`dispose` 后不再触发
@@ -247,7 +259,7 @@ node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/t
 ## 已知限制
 
 - DSH 处于**开发者预览**，官方警告会有破坏性变更。本插件依赖
-  `ctx.connection.authorizeIndex` / `requestRejection` / `browserAuth.maxAgeMilliseconds` 与 `ctx.webServer.server`，
+  `ctx.connection.authorizeIndex` / `admit` / `requestRejection` / `browserAuth.maxAgeMilliseconds` 与 `ctx.webServer.server`，
   DSH 升级后建议重跑测试。
 - 依赖 `authorizeIndex` 无服务端副作用（只签名 cookie、不写状态）。
   若上游改为写会话表，探测方式需要重新评估。
@@ -256,6 +268,8 @@ node --experimental-transform-types /path/to/dsh-telegram-login-approval/tests/t
 - 单进程管理一个状态目录；不支持多个DSH进程共享写同一会话/设置文件。
 - 不取消已进入处理的HTTP请求或已有SSE响应；新API请求被拒，已有WS会被关闭。
 - Session期限上限来自DSH实际原生Cookie寿命（默认30天）；更长寿命须后续人工调整DSH配置并重启，不能仅改浏览器Max-Age。
+- 绑定地址推荐 `127.0.0.1`；支持本机具体 IPv4/IPv6，不接受 `0.0.0.0`、`::` 或其 IPv4-mapped 通配形式。为保持标准 URL 展示，暂不支持 `%zone`；主机名与带方括号的输入也不接受。接口是否属于本机仍由 DSH/操作系统绑定时判断。
+- 已保存的旧通配地址会明确报错，不自动迁移；人工备份后改成具体地址再检查，不能仅改 overlay（保存值优先）。
 - 内部地址是实际监听信息，不是绕过公开HTTPS认证的登录入口；无法取得可信真实客户端IP。
 - WS治理依赖已提供的WebServer.server和Node upgrade分发；DSH接口变更后需要重新验证。
 

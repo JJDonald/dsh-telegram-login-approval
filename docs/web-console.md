@@ -27,7 +27,7 @@
 
 | 项目 | 支持输入 | 生效策略 |
 | --- | --- | --- |
-| 绑定地址 | `127.0.0.1` / `0.0.0.0`（DSH实际支持） | 保存待下次人工启动加载；`0.0.0.0` 会监听所有IPv4接口，需自行审核网络暴露 |
+| 绑定地址 | 本机具体 IPv4/IPv6，推荐 `127.0.0.1`；也可如 `::1`、具体接口 IP | 保存待下次人工启动加载；拒绝 `0.0.0.0`、`::` 及其等价通配形式，不扩大监听范围 |
 | 绑定端口 | 1–65535整数 | 保存待下次人工启动加载 |
 | 自定义地址 | 规范 `https://域名[:端口]`，无尾斜杠、路径、查询、用户名 | 保存待下次人工启动加载；不会自动改代理、TLS、DNS |
 | Session有效期 | 1–当前DSH原生Cookie寿命的整数天，默认30 | 新创建Web Session使用；旧Session保持原到期 |
@@ -35,6 +35,9 @@
 | 失败登录冷却 | 60–86400整数秒，默认600 | 仅错误密钥受限；新发生的冷却使用新值，已启动冷却保持原截止 |
 
 保存的 `web-settings.json` 优先于 overlay 默认值。绑定/公开地址保存不影响本次运行，卡片明确同时展示当前运行值和待生效值；期限保存即影响后续新条目。
+DSH 0.2.1-rc.2 拒绝全接口绑定；插件、SettingsStore 和启动脚本复用同一校验器，保存与启动检查均拒绝通配地址，包括展开的全零 IPv6 与 `::ffff:0.0.0.0`。
+输入 IP 时不带方括号；IPv6 内部地址显示为 `http://[::1]:端口/`。当前产品不接受域名或 `%zone` 接口标识（新版 DSH 本身可支持后者）；不会在保存时探测接口，实际能否绑定由 DSH/操作系统判断。
+若旧设置已保存 `0.0.0.0`，会明确阻断加载，不静默改为别的地址。后续人工操作须先备份该设置文件，再将 host 改成 `127.0.0.1` 或经审核的具体接口 IP，并运行 `--check`；单改 overlay 不会覆盖旧保存值，也无需删除会话文件。
 原生 DSH Cookie 的服务端签名验证完全保留，独立会话层只进一步缩短寿命，不修改其签名字段或假装通过改浏览器 Max-Age 延长。
 上限读取实际 `connection.browserAuth.maxAgeMilliseconds`；默认原生30天，因此默认可选1–30天。
 若人工配置了更短原生寿命，需同步降低插件 `sessionDays` 或已保存的设置，否则启动报错而不是无声放宽。
@@ -53,7 +56,8 @@
 - 原生DSH签名Cookie继续承担原有认证，额外 `__Host-dsh-web-session` 必须对应未过期、未撤销、当前Host的持久哈希记录。两层缺一不可。
 - 升级后仅有旧DSH Cookie的浏览器必须重新登录一次；没有旧Cookie兼容通道。
 - 多浏览器独立获批，各有32字节随机凭证，不互相顶掉。批准请求仍单次消费并绑定nonce。
-- `authorizeIndex` 与 `requestRejection` 包装共享prototype；API仍走DSH原认证和Host/Origin fence，卸载完整恢复描述符。
+- `authorizeIndex`、`admit` 与 `requestRejection` 包装共享prototype；API仍走DSH原认证和Host/Origin fence，卸载完整恢复描述符。新版 HTTP RPC 直接调用 admit，升级时必须保留现有本地双入口补丁，不能用未包含补丁的旧 Git HEAD 覆盖。
+- 不是全局 HTTP 门禁；第三方自行注册的普通 HTTP 路由须自行调用 Connection 或提供适当认证。
 - WebServer的实际 `server.emit` 在原upgrade路由之前检查两层认证；不移除/替换上游协议路由，不绕过原 fence。
 - 通过的upgrade原socket按Session跟踪；撤销立即destroy该会话所有socket，到期计时也会关闭；新upgrade拒绝。卸载恢复emit并关闭已跟踪socket。
 - 合法新会话在插件/进程重启后继续有效（同时要求DSH原生签名凭据保留）；撤销后的记录不会重建或从备份自动复活。
@@ -77,7 +81,7 @@ JSON损坏会阻断启动，不静默重建会话。备份由管理员人工恢�
    node --experimental-transform-types /path/to/plugin/scripts/serve.ts /path/to/serve.json --check
    ```
 
-   不启动DSH、不访问网络。检查输出读取保存的网络值并形成真实 `--host`、`--port`、`--trusted-host` 参数。
+   不启动DSH、不访问网络。先校验保存值（不存在时校验初始值），再形成 `--host`、`--port`、`--trusted-host` 参数；通配地址或非法 IP 会在产生启动参数、spawn DSH 之前报错。
 4. 人工核对nginx upstream端口/地址、server_name、TLS与DNS；自行按批准流程改代理。插件和脚本不会自动更改它们。
 5. 经批准的人工启动入口改为：
 

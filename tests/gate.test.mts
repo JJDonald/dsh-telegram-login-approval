@@ -15,6 +15,9 @@ import { chmodSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { SessionStore } from '../src/sessions.ts'
 import { FailureLimiter } from '../src/rate-limit.ts'
+import { SettingsStore, validateSetting } from '../src/settings.ts'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { resolveConfig } from '../src/config.ts'
@@ -120,10 +123,21 @@ class FakeConnection {
   /** 记录原 authorizeIndex 被真正调用的次数（即凭证交换次数）。 */
   static exchanges = 0
 
+  // 同一套用例分别覆盖 0.2.0-rc.2 与 0.2.1-rc.2 的相反调用方向。
+  static legacy = process.env.TLA_TEST_CONNECTION_MODE === 'legacy'
   browserAuth = { maxAgeMilliseconds: 30 * 86400_000 }
-  requestRejection(req: { headers: Record<string, string> }): number | undefined {
+  private nativeRejection(req: { headers: Record<string, string> }): number | undefined {
     if (req.headers.host !== 'test.example.com' || (req.headers.origin && req.headers.origin !== ORIGIN)) return 403
     return req.headers.cookie?.includes('fake-session=v1.signed') ? undefined : 401
+  }
+  requestRejection(req: { headers: Record<string, string> }): number | undefined {
+    if (FakeConnection.legacy) return this.nativeRejection(req)
+    const result = this.admit(req)
+    return 'rejection' in result ? result.rejection : undefined
+  }
+  admit(req: { headers: Record<string, string> }): { peer: FakeConnection } | { rejection: number } {
+    const rejection = FakeConnection.legacy ? this.requestRejection(req) : this.nativeRejection(req)
+    return rejection === undefined ? { peer: this } : { rejection }
   }
 
   authorizeIndex(_req: { url?: string }, res: { writeHead(s: number, h?: Record<string, string>): void; end(b?: string): void }): boolean {
@@ -303,6 +317,9 @@ async function check(name: string, fn: () => Promise<void> | void): Promise<void
 console.log('=== 登录门禁集成验证（fake ctx + fake Telegram）===\n')
 
 const ctx = makeCtx()
+const originalAdmit = FakeConnection.prototype.admit
+const originalRejection = FakeConnection.prototype.requestRejection
+console.log(`Connection 调用方向：${FakeConnection.legacy ? '旧版 admit → requestRejection' : '新版 requestRejection → admit'}\n`)
 
 await check('插件 apply 成功执行', () => {
   mod.apply(ctx, {
@@ -398,6 +415,24 @@ await check('【安全】Telegram 批准 → 单次交换 DSH 凭证（303 → /
   sessionCookie = `fake-session=v1.signed; ${setCookie[2]!.split(';')[0]}`
 })
 
+await check('【安全】admit 与 requestRejection 双入口都要求两层 Cookie，并保留原生 fence', () => {
+  const connection = new FakeConnection()
+  for (const [headers, status] of [
+    [{}, 401],
+    [{ cookie: 'fake-session=v1.signed' }, 401],
+    [{ cookie: sessionCookie.replace('fake-session=v1.signed; ', '') }, 401],
+    [{ cookie: sessionCookie, origin: 'https://evil.example' }, 403],
+    [{ cookie: sessionCookie, host: 'evil.example' }, 403],
+  ] as Array<[Record<string, string>, number]>) {
+    const req = makeReq('POST', '/api/settings.describe', headers) as any
+    assert.deepEqual(connection.admit(req), { rejection: status })
+    assert.equal(connection.requestRejection(req), status)
+  }
+  const accepted = makeReq('POST', '/api/settings.describe', { cookie: sessionCookie }) as any
+  assert.ok('peer' in connection.admit(accepted), '合法双层会话应通过直接 admit')
+  assert.equal(connection.requestRejection(accepted), undefined)
+})
+
 await check('【安全】批准不可重放：再次访问等待页被拒', async () => {
   const out = await getStatus(cookie, requestId)
   assert.equal(out.status, 401, `期望 401，实际 ${out.status}`)
@@ -439,6 +474,47 @@ await check('配置：botUsername 去掉前导 @ 并规范化', () => {
 await check('配置：批准TTL可调且限定30–3600秒', () => {
   assert.equal(resolveConfig({ ...base, ttlSeconds: 60 }).ttlSeconds, 60)
   assert.throws(() => resolveConfig({ ...base, ttlSeconds: 29 }))
+})
+
+await check('绑定配置：接受具体 IPv4/IPv6，拒绝通配地址并保留原保存值', () => {
+  for (const host of ['127.0.0.1', '192.0.2.7', '::1', '2001:db8::7', '::ffff:127.0.0.1']) {
+    assert.equal(validateSetting('host', host, 30), host)
+  }
+  for (const host of ['0.0.0.0', '::', '0:0:0:0:0:0:0:0', '::0.0.0.0', '::ffff:0.0.0.0', '::ffff:0:0', 'localhost', '[::1]', 'fe80::1%eth0']) {
+    assert.throws(() => validateSetting('host', host, 30), /绑定地址|绑定|地址/)
+  }
+  const file = join(process.env.DSH_HOME!, 'host-settings.json')
+  const defaults = { host: '127.0.0.1', port: 3080, publicOrigin: ORIGIN, sessionDays: 30, approvalSeconds: 300, failureCooldownSeconds: 600 }
+  const settings = new SettingsStore(file, defaults, 30)
+  settings.set('host', '::1')
+  const saved = readFileSync(file, 'utf8')
+  assert.throws(() => settings.set('host', '0.0.0.0'), /通配/)
+  assert.equal(settings.value.host, '::1')
+  assert.equal(readFileSync(file, 'utf8'), saved)
+  writeFileSync(file, JSON.stringify({ host: '0.0.0.0' }))
+  assert.throws(() => new SettingsStore(file, defaults, 30), /通配/, '旧通配设置须明确报错，不静默放宽或迁移')
+})
+
+await check('启动脚本 --check：校验默认和保存地址，拒绝通配值，不启动DSH', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tla-serve-'))
+  const file = join(dir, 'serve.json')
+  const config = { dshBin: '/not-executed-dsh.js', patch: '/unused-overlay.yml', dataDir: dir, host: '127.0.0.1', port: 3080, publicOrigin: ORIGIN }
+  const run = () => spawnSync(process.execPath, ['--experimental-transform-types', fileURLToPath(new URL('../scripts/serve.ts', import.meta.url)), file, '--check'], { encoding: 'utf8' })
+  writeFileSync(file, JSON.stringify(config))
+  let result = run()
+  assert.equal(result.status, 0, result.stderr)
+  let args = JSON.parse(result.stdout).args as string[]
+  assert.equal(args[args.indexOf('--host') + 1], '127.0.0.1')
+  writeFileSync(join(dir, 'web-settings.json'), JSON.stringify({ host: '::1' }))
+  result = run()
+  assert.equal(result.status, 0, result.stderr)
+  args = JSON.parse(result.stdout).args
+  assert.equal(args[args.indexOf('--host') + 1], '::1')
+  writeFileSync(join(dir, 'web-settings.json'), JSON.stringify({ host: '0.0.0.0' }))
+  result = run()
+  assert.equal(result.status, 1)
+  assert.match(result.stderr, /通配/)
+  assert.equal(result.stdout, '')
 })
 
 await check('【安全】仅原生旧Cookie被拒，新会话可持久化且多浏览器独立', () => {
@@ -491,6 +567,7 @@ await check('【安全】管理卡片私聊/消息绑定、设置回复绑定、
   const yes = tg.payloads.at(-1)!.reply_markup.inline_keyboard[0][0].callback_data
   queue.push(callbackUpdate('web', yes)); await sleep(60)
   assert.equal(new FakeConnection().requestRejection(makeReq('GET', '/api', { cookie: sessionCookie }) as any), 401)
+  assert.deepEqual(new FakeConnection().admit(makeReq('GET', '/api', { cookie: sessionCookie }) as any), { rejection: 401 }, '撤销后直接 admit 也须拒绝')
   assert.equal(request('GET', '/', { cookie: sessionCookie }).status, 200, '撤销后首页必须回登录表单')
   assert.equal(new SessionStore(`${process.env.DSH_HOME}/storages/telegram-login-approval/web-sessions.json`).list().length, 0)
   assert.ok(!logs.join('\n').includes(SECRET) && !logs.join('\n').includes(sessionCookie))
@@ -519,6 +596,9 @@ await check('卸载后还原原型方法', () => {
   for (const dispose of effects) dispose()
   const proto = Object.getPrototypeOf(new FakeConnection()) as { authorizeIndex: { name: string } }
   assert.equal(proto.authorizeIndex.name, 'authorizeIndex', '应还原为原方法')
+  assert.equal(FakeConnection.prototype.admit, originalAdmit, 'admit 描述符应还原')
+  assert.equal(FakeConnection.prototype.requestRejection, originalRejection, 'requestRejection 描述符应还原')
+  assert.ok('peer' in new FakeConnection().admit(makeReq('GET', '/api', { cookie: 'fake-session=v1.signed' }) as any))
   assert.equal(new FakeConnection().requestRejection(makeReq('GET', '/api', { cookie: 'fake-session=v1.signed' }) as any), undefined, 'requestRejection应还原')
 })
 

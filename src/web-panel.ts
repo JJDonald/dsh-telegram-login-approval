@@ -38,10 +38,11 @@ export class WebPanel {
   async show(): Promise<void> {
     const { runtime: r, settings, sessions } = this.o
     const s = settings.value
-    const internal = r.host === '0.0.0.0' ? `http://127.0.0.1:${r.port}/（本机；监听所有IPv4接口）` : `http://${r.host}:${r.port}/`
-    const text = ['🌐 <b>Web 管理台</b>', '状态：启用', `当前绑定：<code>${e(r.host)}:${r.port}</code>`,
+    const bind = (host: string, port: number) => `${host.includes(':') ? `[${host}]` : host}:${port}`
+    const internal = `http://${bind(r.host, r.port)}/`
+    const text = ['🌐 <b>Web 管理台</b>', '状态：启用', `当前绑定：<code>${e(bind(r.host, r.port))}</code>`,
       `内部访问地址：${e(internal)}（认证仍需公开HTTPS Host，不是另一个登录入口）`,
-      `当前公开地址：${e(r.publicOrigin)}`, `待下次人工启动：${e(s.host)}:${s.port} · ${e(s.publicOrigin)}`,
+      `当前公开地址：${e(r.publicOrigin)}`, `待下次人工启动：${e(bind(s.host, s.port))} · ${e(s.publicOrigin)}`,
       `访问密钥：<code>${e(this.o.key())}</code>`, `当前 Web Session：${sessions.list().length}`,
       `待确认登录：${this.o.pendingCount()}`, `Session有效期：${s.sessionDays} 天（上限 ${settings.maxDays} 天）`,
       `登录确认有效期：${s.approvalSeconds} 秒`, `失败登录冷却：${s.failureCooldownSeconds} 秒（全局10次错误/60秒）`,
@@ -104,7 +105,7 @@ export class WebPanel {
     if (action?.startsWith('set-')) {
       const field = action.slice(4) as Setting
       if (!(field in labels)) return true
-      const range = field === 'host' ? '127.0.0.1 或 0.0.0.0' : field === 'port' ? '1–65535整数' : field === 'publicOrigin' ? 'https://域名[:端口]，无尾斜杠或路径' : field === 'sessionDays' ? `1–${this.o.settings.maxDays} 整数天` : field === 'approvalSeconds' ? '30–3600整数秒' : '60–86400整数秒'
+      const range = field === 'host' ? '推荐 127.0.0.1；也可填本机具体 IPv4/IPv6 地址（如 ::1，无方括号或 %zone），禁止 0.0.0.0 / :: 等通配地址' : field === 'port' ? '1–65535整数' : field === 'publicOrigin' ? 'https://域名[:端口]，无尾斜杠或路径' : field === 'sessionDays' ? `1–${this.o.settings.maxDays} 整数天` : field === 'approvalSeconds' ? '30–3600整数秒' : '60–86400整数秒'
       await this.send(`请<b>回复此消息</b>设置「${labels[field]}」：${e(range)}\n10分钟内有效；/cancel 取消。`, () => [], { field }); return true
     }
     if (/^list-\d+$/.test(action ?? '')) { await this.list(Number(action!.slice(5))); return true }
